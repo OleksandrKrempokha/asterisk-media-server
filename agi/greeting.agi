@@ -1,0 +1,361 @@
+#!/usr/bin/perl
+#author KimWon, HanSangHyok
+#2009-06-20  3:21 first
+#2009-07-06  3:22 second : essentional_development
+
+use strict;
+use DBI;
+use Sys::Hostname;
+use Socket;   
+use Time::localtime;                         # for AF_INET
+#use Digest::MD5 qw(md5_hex);
+
+$|=1;
+
+# Setup some variables
+my %AGI; my $tests = 0; my $fail = 0; my $pass = 0; my $dbh;
+my $is_outcaller = 0;
+my $varlibdir="/usr/local/var/trismedia";
+my $spooldir="/usr/local/spool/trismedia";
+my $cs_ipaddr = "127.0.0.1";
+
+while(<STDIN>) {
+	chomp;
+	last unless length($_);
+	if (/^agi_(\w+)\:\s+(.*)$/) {
+		$AGI{$1} = $2;
+	}
+	print STDERR 
+}
+
+print STDERR "AGI Environment Dump:\n";
+foreach my $i (sort keys %AGI) {
+	print STDERR " -- $i = $AGI{$i}\n";
+}
+
+open CONFIG, "</usr/local/etc/trismedia/trismedia.conf";
+while (<CONFIG>) {
+    if(/^trisvarlibdir => (.+)/) {
+	print STDERR "libpath=".$1."\n";
+	$varlibdir = $1;
+    }
+    elsif(/^trisspooldir => (.+)/) {
+	print STDERR "spoolpath=".$1."\n";
+	$spooldir = $1;
+    }
+    elsif(/^cs_ipaddr => (.+)/) {
+	print STDERR "cs_ipaddr=".$1."\n";
+	$cs_ipaddr = $1;
+    }
+}
+close CONFIG;
+
+sub checkresult {
+	my ($res) = @_;
+	my $retval;
+	$tests++;
+		
+	chomp $res;
+	if ($res =~ /^200/) {
+		$res =~ /result=(-?\d+)/;
+		if (!length($1)) {
+			print STDERR "FAIL ($res)\n";
+			$fail++;
+		} else {	
+			print STDERR "$res\n";		
+			print STDERR "PASS ($1)\n";			
+			$pass++;
+			if ( $res =~ /\s*\((.*)\)/ ){				
+				return $1;
+			}
+			return $1;
+		}
+	} else {
+		print STDERR "FAIL (unexpected result '$res')\n";
+		$fail++;
+	}
+	-1;
+}
+
+sub check_wiretap {
+	my $callerid = $AGI{"callerid"};
+	my $callee = $AGI{"extension"};
+	
+	$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+	my $list = $dbh->selectrow_arrayref("SELECT uid,name from user_info where extension = '$callerid' AND tapping = 1");
+	if (!length($list->[0])) {
+		$dbh->disconnect();
+		return 0;
+	} else { 
+		my $tm = localtime();
+		my $monitor_fn = sprintf("%04d%02d%02d-%02d%02d%02d-%s-%s",
+    			($tm->year+1900),($tm->mon+1), $tm->mday,$tm->hour, $tm->min, $tm->sec, $callerid,$callee);
+	    	my $res = &exec_ref("EXEC Monitor \",$monitor_fn,m\" \n");		
+		print STDERR "check result is $res \n";
+		$dbh->disconnect();
+	    	return $res;
+	}
+}
+
+sub replace_callerid {
+	my ($username) = @_;
+	$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+
+	my $res = $dbh->selectrow_arrayref("SELECT extension FROM uri WHERE username = '$username'");
+	if(length($res->[0])) {
+		&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<$res->[0]>\n");
+		$AGI{"callerid"} = $res->[0];
+		$dbh->disconnect();
+		return 0;
+	}
+	$dbh->disconnect();
+	return 1;
+}
+
+sub exec_ref {
+	my ($arg1) = @_;
+	print $arg1;
+	my $result = <STDIN>;
+	my $res = &checkresult($result);
+	return $res;
+}
+
+sub get_uid{
+	my ($username) = @_;
+	$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+	my ($uid) = $dbh->selectrow_array("SELECT uid FROM uri WHERE username = '$username'");
+	$dbh->disconnect();
+	return $uid;
+}
+
+sub check_pin() {
+	my ($uid, $password) = @_;
+	$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+          'tris', 'tris',
+          { RaiseError => 1, AutoCommit => 1 });
+        my @row = $dbh->selectrow_array("SELECT pin FROM user_info AS u JOIN credentials AS c ON u.uid=c.uid WHERE extension = '$uid'");
+    	print STDERR "$password  $row[0]\n";
+        if($password eq $row[0]) {
+        	$dbh->disconnect();
+		return 1;
+        } else {
+        	$dbh->disconnect();
+    		return 0;
+        }
+	
+}
+
+sub outcaller_authorize {
+	my $exten, my $flag = 0, my $row;
+	for(my $i=0; $i<3; $i++) {
+		$exten = &get_data("voicemail/dial_extn_pound");
+		$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+		$row = $dbh->selectrow_arrayref("SELECT extension,uid FROM uri WHERE username ='$exten'");
+		if($exten and !length($row->[0])) {
+			$dbh->disconnect();
+			&exec_ref("STREAM FILE voicemail/is_not_found \"\"\n");
+		} elsif($exten) {
+			$dbh->disconnect();
+			$flag = 1;
+			last;
+		} else {
+			$dbh->disconnect();
+		}
+	}
+	if(!$flag) {
+		return 0;
+	}
+	
+	for(my $i=0; $i<3; $i++) {
+    		my $res = &get_data("voicemail/enter_pin");
+		if(&check_pin($exten, $res)) {
+			$AGI{"calleridname"} = $row->[1];
+			$AGI{"callerid"} = $exten;
+			&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<${exten}>\n");
+			return 1;
+		} elsif($res) {
+			&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+		}
+	}
+	return 0;
+}
+
+sub get_data {
+	my ($fname) = @_;
+	my $password = "";
+	my $res = &exec_ref("GET OPTION $fname \"0123456789*#\" 5000 \n");
+	if(!$res) {
+		return $res;
+	}
+
+	if ($res > 0  && $res != 35) {
+	    $password .= chr($res);
+	}
+	while($res != 35) { # while "#"
+	    $res = &exec_ref("WAIT FOR DIGIT 3000 \n");
+	    if ($res > 0 && $res != 35) {
+	        $password .= chr($res);
+	    }
+	    else {
+	        last;
+	    }
+	}
+	return $password;
+}
+
+sub greeting {
+	if($is_outcaller) {
+		if(!&outcaller_authorize()) {
+			return;
+		}
+	}
+	
+	my $res = 0;
+	my $pressedkey;
+	my $callerid = $AGI{"callerid"};
+	my $greeting_file_prefix = $callerid;
+	
+TOP_LOOP:
+	if(!$res) {
+        	$res = &exec_ref("GET OPTION voicemail/greeting_menu \"0123456789*#\" \"5000\"\n");
+        }
+	#$res = &exec_ref("STREAM FILE voicemail/greeting_menu \"123*\"\n");	    
+	if ($res <= 0) {
+		#$res = &exec_ref("WAIT FOR DIGIT 3000 \n");
+	    #if ($res <= 0) {
+	    	goto "TOP_LOOP";
+		#}
+	}
+	
+	unless(-e -d "$spooldir/voicemail/default/${callerid}") {
+		mkdir "$spooldir/voicemail/default/${callerid}",0755;
+	}
+			
+	$pressedkey = chr($res);
+	#print STDERR "RETURN is .....$res 	\n" ;
+	if ( $pressedkey == 1 ) {
+	#	system ("mkdir $spooldir/voicemail/default/${callerid} ");
+		system ("mv -f $spooldir/voicemail/default/${callerid}/greeting_y.wav $spooldir/voicemail/default/${callerid}/greeting_n.wav") ;
+		&exec_ref("STREAM FILE voicemail/selected_default_greeting	\"\"\n");
+	} elsif ( $pressedkey == 2 ) {
+		my $playfilename = "", my $recordingfilename ;
+		if ( -e "$spooldir/voicemail/default/${callerid}/greeting_y.wav") {
+			$playfilename = "$spooldir/voicemail/default/${callerid}/greeting_y" ;
+		} elsif ( -e "$spooldir/voicemail/default/${callerid}/greeting_n.wav") {
+			$playfilename = "$spooldir/voicemail/default/${callerid}/greeting_n" ;
+		} else {
+			&exec_ref("STREAM FILE voicemail/no_recorded_greeting \"\"\n");
+			$res = 0;
+			goto "TOP_LOOP";
+		}
+		
+		$recordingfilename = "$spooldir/voicemail/default/${callerid}/greeting_n" ;
+TWO_OPTION_MENU:
+		$res = &exec_ref("GET OPTION voicemail/listen_old_greeting \"12*\" 5000 \n");		
+		if ( $res <= 0 ) {
+			goto "TWO_OPTION_MENU";
+		}
+		$pressedkey = chr($res);
+		if ( $pressedkey == 1 ) {
+			if (!length($playfilename)){
+				$res = &exec_ref("STREAM FILE voicemail/no_recorded_greeting \"*\"\n");
+				$res = 0;
+				goto "TOP_LOOP";
+			}
+			$res = &exec_ref("STREAM FILE $playfilename \"*\"\n");
+			$pressedkey = chr($res);
+			if ( $pressedkey eq "*" ) {
+				$res = 0;
+				goto "TOP_LOOP";
+			}
+			goto "TWO_OPTION_MENU";					
+		} elsif ( $pressedkey == 2 ) {
+			if (!length($playfilename)){
+				$res = 0;
+				&exec_ref("STREAM FILE voicemail/no_recorded_greeting \"*\"\n");
+				goto "TOP_LOOP";
+			}				
+			system ("mv -f $recordingfilename $spooldir/voicemail/default/${callerid}/greeting_y.wav ");
+			&exec_ref("STREAM FILE voicemail/selected_recorded_greeting \"*\"\n");
+		} elsif ( $pressedkey eq "*" ) {
+			$res = 0;
+			goto "TOP_LOOP";
+		}		
+	} elsif ( $pressedkey == 3 ) {
+THREE_NEW_RECORD:
+		&exec_ref("STREAM FILE voicemail/record_greeting \"0123456789*#\" \n");
+		&exec_ref("RECORD FILE $spooldir/voicemail/default/${callerid}/greeting_n \"wav\" \"#\" \"-1\" \"\" \"beep\" \n");
+THREE_MENU:
+		$res = &exec_ref("GET OPTION voicemail/greeting_record_options \"1234567890*#\" 5000 \n");
+		$pressedkey = chr($res);
+		if ( $pressedkey == 1 ) {
+THREE_ONE:
+			$res = &exec_ref("STREAM FILE $spooldir/voicemail/default/${callerid}/greeting_n \"1234567890*\" \n");
+			if ( $res > 0 ) {
+				$pressedkey = chr($res);
+				if ($pressedkey == 1 ) {
+					goto "THREE_ONE";
+				} elsif ($pressedkey == 2 ) {
+					goto "THREE_TWO";
+				} elsif ($pressedkey ==3 ) {
+					goto "THREE_MENU";
+				} else { 
+					&exec_ref("STREAM FILE voicemail/invalid_entry_try_again \"\" \n");
+					goto "THREE_MENU";
+				}
+			}						
+			goto "THREE_MENU";
+		} elsif ( $pressedkey == 2 ) {
+THREE_TWO:
+			system ("mv -f $spooldir/voicemail/default/${callerid}/greeting_n.wav $spooldir/voicemail/default/${callerid}/greeting_y.wav " );
+			&exec_ref("STREAM FILE voicemail/selected_recorded_greeting \"*\"\n");	
+			goto "BYE";	
+		} elsif ( $pressedkey == 3 ) {
+			goto "THREE_NEW_RECORD";
+		} elsif ( $pressedkey eq "*" ) {
+			$res = 0;
+			goto "TOP_LOOP";
+		} elsif ($res) {
+			&exec_ref("STREAM FILE voicemail/invalid_entry_try_again \"0123456789*#\" \n");
+			goto "THREE_MENU";
+		}
+		goto "THREE_MENU";
+		
+	} elsif ( $pressedkey == '*' ) {
+	
+BYE:
+		&exec_ref("STREAM FILE goodbye \"\"\n");
+	}
+	elsif ($res) {
+		$res = 0;
+		$res = &exec_ref("STREAM FILE voicemail/invalid_entry_try_again \"0123456789*#\" \n");
+		goto "TOP_LOOP";
+	} 
+	
+}
+
+
+
+#  =======================  main - begin ========================
+
+#print STDERR "1.  Testing 'sendfile'...";
+#print "STREAM FILE beep \"\"\n";
+#my $result = <STDIN>;
+#&checkresult($result);
+
+&exec_ref("Answer \"\"\n");
+$is_outcaller = &replace_callerid($AGI{"callerid"});
+&check_wiretap();
+&greeting();
+
+print STDERR "================== Complete ======================\n";
+print STDERR "$tests tests completed, $pass passed, $fail failed\n";
+print STDERR "==================================================\n";

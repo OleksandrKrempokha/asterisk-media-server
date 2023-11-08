@@ -1,0 +1,31 @@
+#
+#       Digium's Trismedia specific radius attributes
+#	markster@digium.com
+#
+#
+
+VENDOR	  Digium	22736
+
+BEGIN-VENDOR	Digium
+
+ATTRIBUTE	Trismedia-Acc-Code		101	string	Digium
+ATTRIBUTE	Trismedia-Src			102	string  Digium
+ATTRIBUTE	Trismedia-Dst			103	string  Digium
+ATTRIBUTE	Trismedia-Dst-Ctx		104	string  Digium
+ATTRIBUTE	Trismedia-Clid			105	string  Digium
+ATTRIBUTE	Trismedia-Chan			106	string  Digium
+ATTRIBUTE	Trismedia-Dst-Chan		107	string  Digium
+ATTRIBUTE	Trismedia-Last-App		108	string  Digium
+ATTRIBUTE	Trismedia-Last-Data		109	string  Digium
+ATTRIBUTE	Trismedia-Start-Time		110	string	Digium
+ATTRIBUTE	Trismedia-Answer-Time		111	string	Digium
+ATTRIBUTE	Trismedia-End-Time		112	string	Digium
+ATTRIBUTE	Trismedia-Duration		113	integer	Digium
+ATTRIBUTE	Trismedia-Bill-Sec		114	integer	Digium
+ATTRIBUTE	Trismedia-Disposition		115	string	Digium
+ATTRIBUTE	Trismedia-AMA-Flags		116	string	Digium
+ATTRIBUTE	Trismedia-Unique-ID		117	string  Digium
+ATTRIBUTE	Trismedia-User-Field		118	string  Digium
+
+END-VENDOR	Digium
+

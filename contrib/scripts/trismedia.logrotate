@@ -1,0 +1,14 @@
+__LOGDIR__/debug __LOGDIR__/console __LOGDIR__/full __LOGDIR__/messages __LOGDIR__/*log {
+	daily
+	missingok
+	rotate 5
+	compress
+	delaycompress
+	notifempty
+	size 100M
+	create 640 root root 
+	sharedscripts
+	postrotate
+		__SBINDIR__/trismedia -rx 'logger reload' > /dev/null 2> /dev/null	
+	endscript
+} 

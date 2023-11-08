@@ -1,0 +1,1214 @@
+#!/usr/bin/perl
+#author KimWon, HanSangHyok
+#2009-06-20  3:21 first
+#2009-07-06  3:22 second : essentional_development
+
+use strict;
+use DBI;
+use Sys::Hostname;
+use Socket;   
+use Time::localtime;                         # for AF_INET
+#use Digest::MD5 qw(md5_hex);
+
+$|=1;
+
+# Setup some variables
+my %AGI; my $tests = 0; my $fail = 0; my $pass = 0; my $dbh;
+my $hostname; my $address; my $park_start = 701; my $park_end= 720;
+my $prohibit_endless_loop = 0; 
+my %services; my $is_outcaller = 0;
+my $varlibdir="/usr/local/var/trismedia";
+my $spooldir="/usr/local/spool/trismedia";
+
+$hostname = hostname( );
+#$address  = gethostbyname($hostname) or die "Couldn't resolve $hostname : $!";
+$address = inet_ntoa(inet_aton($hostname));
+#print STDERR "HOSTNAME is ".$hostname."\n";
+#print STDERR "ADDRESS is ".$address."\n";
+
+while(<STDIN>) {
+	chomp;
+	last unless length($_);
+	if (/^agi_(\w+)\:\s+(.*)$/) {
+		$AGI{$1} = $2;
+	}
+	print STDERR 
+}
+
+print STDERR "AGI Environment Dump:\n";
+foreach my $i (sort keys %AGI) {
+	print STDERR " -- $i = $AGI{$i}\n";
+}
+
+$dbh = DBI->connect('dbi:mysql:trisdb:localhost:3306',
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+
+my $srv_list = $dbh->selectall_arrayref("SELECT service_number, service_name from media_service");
+foreach (@$srv_list) {
+	if($_->[1] eq "park_start") {
+		$park_start = $_->[0];
+	} elsif($_->[1] eq "park_end") {
+		$park_end = $_->[0];		
+	} else {
+		$services{$_->[0]} = $_->[1];
+	}
+}
+	
+sub checkresult {
+	my ($res) = @_;
+	my $retval;
+	$tests++;
+		
+	chomp $res;
+	if ($res =~ /^200/) {
+		$res =~ /result=(-?\d+)/;
+		if (!length($1)) {
+			print STDERR "FAIL ($res)\n";
+			$fail++;
+		} else {	
+			print STDERR "$res\n";		
+			print STDERR "PASS ($1)\n";			
+			$pass++;
+			if ( $res =~ /\s*\((.*)\)/ ){				
+				return $1;
+			}
+			return $1;
+		}
+	} else {
+		print STDERR "FAIL (unexpected result '$res')\n";
+		$fail++;
+	}
+	-1;
+}
+
+sub check_wiretap {
+	my $callerid = $AGI{"callerid"};
+	my $callee = $AGI{"extension"};
+	my $list = $dbh->selectrow_arrayref("SELECT uid,name from user_info where extension = '$callerid' AND tapping = 1");
+	if (!length($list->[0])) {
+		return 0;
+	} else { 
+		my $tm = localtime();
+		my $monitor_fn = sprintf("%04d%02d%02d-%02d%02d%02d-%s-%s",
+    			($tm->year+1900),($tm->mon+1), $tm->mday,$tm->hour, $tm->min, $tm->sec, $callerid,$callee);
+	    	my $res = &exec_ref("EXEC Monitor \",$monitor_fn,m\" \n");		
+		print STDERR "check result is $res \n";
+	    	return $res;
+	}
+	
+	
+}
+
+sub replace_callerid {
+	my ($username) = @_;
+	my $res = $dbh->selectrow_arrayref("SELECT extension FROM uri WHERE username = '$username'");
+	if(length($res->[0])) {
+		&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<$res->[0]>\n");
+		$AGI{"callerid"} = $res->[0];
+		return 0;
+	}
+	return 1;
+}
+
+sub run_service {
+	my ($service_name) = @_;
+	my $callerid = $AGI{"callerid"};
+	print STDERR "service_name is ".$service_name." !!!\n";
+	if ($service_name =~ /\bautoattendance\b/) {
+	    &autoattendance();
+	}
+	elsif ($service_name =~ /\bleave_vm\b/) {
+	    &exec_ref("EXEC Voicemail \"\"\n");
+	}
+	elsif ($service_name =~ /\blisten_vm\b/) {
+#	    &exec_ref("EXEC VoicemailMain \"$callerid\"\n");
+	    &Listen_Voicemail($callerid);
+	}
+	elsif ($service_name =~ /\bcallconf\b/) {
+	    &callconf();
+	}
+	elsif ($service_name =~ /\bscheduleconf\b/) {
+	    &scheduleconf();
+	}
+	elsif ($service_name =~ /\burgencyconf\b/) {
+	    &urgencyconf();
+	}
+	elsif ($service_name =~ /\bbroadcast\b/) {
+	    &broadcast();
+	}
+	elsif ($service_name =~ /\bannouncement\b/) {
+	    &announcement();
+	}
+	elsif ($service_name =~ /\bgreeting\b/) {
+	    &greeting();
+	}
+	elsif ($service_name =~ /\bbroadvm\b/) {
+	    &broadvm();
+	}
+	elsif ($service_name =~ /\bleave_general_cmd\b/) {
+	    #&leave_general_cmd();
+	    &exec_ref("EXEC LeaveCommand \"\"\n");
+	}
+	elsif ($service_name =~ /\blisten_general_cmd\b/) {
+	    &listen_general_cmd();
+	}
+	elsif ($service_name =~ /\bleave_report\b/) {
+	    #&leave_report();
+	    &exec_ref("EXEC LeaveReport \"\"\n");
+	}
+	elsif ($service_name =~ /\blisten_report\b/) {
+	    &listen_report();
+	}
+	
+	#elsif($service_name =~ /\bprompt_message\b/) {
+	#    &prompt_message($AGI{"extension"});
+	#}
+}
+
+sub exec_ref {
+	my ($arg1) = @_;
+	print $arg1;
+	my $result = <STDIN>;
+	my $res = &checkresult($result);
+	return $res;
+}
+
+sub Listen_Voicemail {
+	my ($callerid) = @_;
+	my $list = $dbh->selectrow_arrayref("SELECT uid from user_info where extension = '$callerid'");
+	if (!length($list->[0])) {
+		&exec_ref("EXEC VoicemailMain \"\"\n");
+	} else {
+		&exec_ref("EXEC VoicemailMain \"$callerid\"\n");
+	}
+}
+
+sub autoattendance { 
+	if($is_outcaller) {
+		return;
+	}
+	
+	my $useTTS = 1;
+	my $res ;
+	my $rows = $dbh->selectall_arrayref("SELECT itemkey, itemid from auto_attendance ");
+	my %hash;
+	
+	foreach (@$rows) {		
+		if($_->[1] =~ /\buseTTS\b/) {			
+		    $useTTS = $_->[0] =~ /y/ ? 1 : 0;
+		    #print STDERR "VALUE".$useTTS."\n";
+		} else {
+			$hash{$_->[0]} = $_->[1];
+			#print STDERR $_->[0]." AND ".$_->[1]."\n";
+		}
+				
+	}
+	
+	#print "STREAM FILE autoattendance/autoattendance \"0123456789*#\"\n";
+	
+	for (my $i=0; $i<3; $i++){
+		if ( $useTTS == 1 ) {
+			$res = &exec_ref("STREAM FILE autoattendance/welcome \"0123456789*#\"\n");
+			if ( $res > 0 ) { goto "AUTO_1";}
+			foreach my $numkey (sort keys %hash) {
+				if ( $numkey != "*") {
+					my $playfilename = "to_".$hash{$numkey};
+					$res = &exec_ref("STREAM FILE autoattendance/${playfilename} \"0123456789*#\"\n");
+					if ( $res > 0 ) { goto "AUTO_1";}
+					$playfilename = ${numkey}."_key" ;
+					$res = &exec_ref("STREAM FILE autoattendance/${playfilename} \"0123456789*#\"\n");
+					if ( $res > 0 ) { goto "AUTO_1";}
+					
+				}
+				#print STDERR " -- $numkey = $hash{$numkey}\n";
+			}
+			#$res = &exec_ref("STREAM FILE autoattendance/press_and \"0123456789*#\"\n");
+			#if ( $res > 0 ) { goto "AUTO_1";}
+			$res = &exec_ref("STREAM FILE autoattendance/to_cancel_press_star \"0123456789*#\"\n");
+			if ( $res > 0 ) { goto "AUTO_1";}
+			
+		} else {
+			$res = &exec_ref("STREAM FILE autoattendance/autoattendance \"0123456789*#\"\n");
+	    }
+	    if ($res <= 0) {
+	    	#print STDERR "WAIT?????\n";
+	    	$res = &exec_ref("WAIT FOR DIGIT 3000\n");
+	    	if ($res <= 0) {
+	    		next;
+			}
+	    }
+	    
+AUTO_1:if(exists($hash{chr($res)})){
+		#print STDERR $hash{chr($res)}."\n";
+		if( $res == 42 ) { # *
+			last;
+		}
+		else {
+			&run_service($hash{chr($res)});
+			return;
+		}
+	    }
+	    else {
+		$res = &exec_ref("STREAM FILE autoattendance/invalid_entry_try_again \"0123456789*#\"\n");
+		if ($res <= 0) {
+		#&exec_ref("STREAM FILE autoattendance/bye \"\"\n");
+		    next;
+		}
+		if ($res > 0) {
+		    goto "AUTO_1";
+		}
+	    }
+	}
+	&exec_ref("STREAM FILE goodbye \"\"\n");
+	#print STDERR "out of for\n";
+	    
+}
+
+sub announcement {
+	for (my $i=0; $i<3; $i++) {
+	    my $res = &exec_ref("STREAM FILE announcement/announcement \"0123456789*#\"\n");
+	    if ($res <= 0) {
+		my $res =&exec_ref("WAIT FOR DIGIT 3000\n");
+		if ($res <= 0) {
+		    next;
+		}
+	    }
+ANN_1:	    if($res == 42) {
+		last;
+	    }
+	    my $chr_res = chr($res);
+	    my @query_res = $dbh->selectrow_array("SELECT itemkey FROM announcement WHERE itemkey = '$chr_res'");
+	    #my $filename = $varlibdir."/sounds/kp/announcement/ann_".chr($res).".wav";
+	    #if( -e $filename ) {
+	    if(length(@query_res[0])) {
+		    
+		    &prompt_message($chr_res);
+		    last;
+	    }
+	    else {
+		    $res = &exec_ref("STREAM FILE announcement/invalid_entry_try_again \"0123456789*#\"\n");
+		    if ($res <= 0) {
+			    next;
+		    }
+		    if ($res > 0) {
+			    goto "ANN_1";
+		    }
+	    }
+	}
+	&exec_ref("STREAM FILE goodbye \"\"\n");
+}
+
+sub get_data {
+	my ($fname) = @_;
+	my $password = "";
+	my $res = &exec_ref("GET OPTION $fname \"0123456789*#\" 5000\n");
+	if(!$res) {
+		return $res;
+	}
+
+	if ($res > 0  && $res != 35) {
+	    $password .= chr($res);
+	}
+	while($res != 35) { # while "#"
+	    $res = &exec_ref("WAIT FOR DIGIT 3000\n");
+	    if ($res > 0 && $res != 35) {
+	        $password .= chr($res);
+	    }
+	    else {
+	        last;
+	    }
+	}
+	return $password;
+}
+
+sub change_pin() {
+	my ($ann_num) = @_;
+	my $new_passwd = ""; my $old_passwd = "";
+	my @query_oneres = $dbh->selectrow_array("SELECT password FROM announcement WHERE itemkey = '$ann_num' ");
+	if(length(@query_oneres[0])) {
+		$old_passwd = @query_oneres[0];
+	}
+	print STDERR "$old_passwd\n";
+	
+	# login
+	my $login = 0;
+	chomp($old_passwd);
+	if($old_passwd ne "" ) {
+	    for(my $i=0; $i<3; $i++){
+		    my $password = &get_data("announcement/enter_old_pin");
+		    #my $md5_passwd = md5_hex($password);
+		    if($old_passwd eq $password){
+			$login = 1;
+			last;
+		    }
+		    else {
+			&exec_ref("STREAM FILE announcement/invalid_old_pin \"\"\n");
+		    }
+	    }
+	}
+	else {
+	    $login = 1;
+	}
+	
+	if(!$login) {
+		#&exec_ref("STREAM FILE announcement/bye \"\"\n");
+		return;
+	}
+	
+	# change password
+	my $valid = 0;
+        for(my $i=0; $i<3; $i++){
+		$new_passwd = &get_data("announcement/enter_new_pin");
+		my $new_passwd_again = &get_data("announcement/enter_new_pin_again");
+		
+		if($new_passwd eq $new_passwd_again){
+			$valid = 1;
+			last;
+		}
+		else {
+			&exec_ref("STREAM FILE announcement/invalid_pin \"\"\n");
+		}
+	}
+	
+	if(!$valid) {
+		&exec_ref("STREAM FILE announcement/pin_not_changed \"\"\n");
+	}
+	else {
+		$dbh->do("UPDATE announcement SET password = '$new_passwd' WHERE itemkey = '$ann_num'");
+		&exec_ref("STREAM FILE announcement/pin_changed \"\"\n");
+	}
+	
+	
+}
+
+sub record_announce() {
+	my ($ann_num) = @_;
+	my $old_passwd = "";
+	my @query_oneres = $dbh->selectrow_array("SELECT password FROM announcement WHERE itemkey = '$ann_num' ");
+	if(length(@query_oneres[0])) {
+		$old_passwd = @query_oneres[0];
+	}
+	print STDERR "$old_passwd\n";
+	
+	# login
+	my $login = 0;
+	chomp($old_passwd);
+	if($old_passwd ne "" ) {
+	    for(my $i=0; $i<3; $i++){
+		    my $password = &get_data("announcement/enter_pin");
+		    #my $md5_passwd = md5_hex($password);
+		    if($old_passwd eq $password){
+			$login = 1;
+			last;
+		    }
+		    else {
+			&exec_ref("STREAM FILE announcement/invalid_pin \"\"\n");
+		    }
+	    }
+	}
+	else {
+	    $login = 1;
+	}
+	
+	if(!$login) {
+		#&exec_ref("STREAM FILE announcement/bye \"\"\n");
+		return;
+	}
+	
+	&exec_ref("STREAM FILE announcement/record_announcement \"#\"\n");
+	&exec_ref("STREAM FILE beep \"\"\n");
+	
+	&exec_ref("RECORD FILE kp/announcement/tmp_".$ann_num." wav \"#\" 600000\n");
+	
+	my $exit = 0;
+	while(!$exit){
+	    my $res = &exec_ref("GET OPTION announcement/ann_deposit_options \"123*\" 3000\n");
+	    if($res == 49) { # 1
+		    &exec_ref("STREAM FILE announcement/tmp_".$ann_num." \"\"\n");
+	    }
+	    elsif($res == 50) { # 2
+		    rename $varlibdir."/sounds/kp/announcement/tmp_".$ann_num.".wav", $varlibdir."/sounds/kp/announcement/ann_".$ann_num.".wav";
+		    unlink $varlibdir."/sounds/kp/announcement/tmp_".$ann_num.".wav";
+		    &exec_ref("STREAM FILE announcement/announce_restored \"\"\n");
+		    #&exec_ref("STREAM FILE announcement/bye \"\"\n");
+		    $exit = 1;
+	    }
+	    elsif($res == 51) { # 3
+		    &exec_ref("STREAM FILE announcement/record_announcement \"\"\n");
+		    &exec_ref("STREAM FILE beep \"\"\n");
+	
+		    &exec_ref("RECORD FILE kp/announcement/tmp_".$ann_num." wav \"#\" 600000\n");
+	    }
+	    elsif($res == 42) { # pressed <*>
+		    unlink $varlibdir."/sounds/kp/announcement/tmp_".$ann_num.".wav";
+		    $exit = 1;
+	    }
+	}
+}
+
+# if you press "**", then you can change password
+# if you press "*#", then you can record annoucement
+sub prompt_message {
+	my ($ann_num) = @_;
+	my $count = 0;
+	my $exit = 0;
+	while (!$exit) {
+		my $res = &exec_ref("STREAM FILE announcement/ann_$ann_num \"*\"\n");
+		if ($res == 42) { # if "*"
+			
+			$res = &exec_ref("WAIT FOR DIGIT 1000\n");
+			if ($res == 42) { # "*"
+				&change_pin($ann_num);
+				$exit = 1;
+			}
+			elsif($res == 35) { # "#"
+				&record_announce($ann_num);
+				$exit = 1;
+			}
+		}
+		$count++;
+		if($count >= 3) {
+			$exit = 1;
+		}
+	}
+}
+
+sub scheduleconf {
+	if($is_outcaller) {
+		if(!&outcaller_authorize()) {
+			return;
+		}
+	}
+
+	my $callerid ;
+	my $table_userid ;
+	my $confno ;
+	my @query_oneres;
+	my $query_res ;
+	my $dtmf_res ;
+	my $user_in_conf = 0;
+	my $retry_count = 1;
+	my $is_sponser = 1;
+	$callerid = $AGI{'callerid'};
+	@query_oneres = $dbh->selectrow_array("SELECT roomno FROM schedule_room WHERE sponseruid = '$callerid' ");
+	if(!length(@query_oneres[0])) {
+		$is_sponser = 0;
+	}
+	
+retry_getno:
+	while($dtmf_res <= 0){
+		$dtmf_res = &exec_ref ("STREAM FILE conference/select_room_num \"0123456789*#\" \n");
+		if ( $dtmf_res <= 0 ) {
+			$dtmf_res = &exec_ref("WAIT FOR DIGIT 4000\n");
+			if ( $dtmf_res <= 0 && $retry_count >= 3) {
+				&exec_ref("STREAM FILE goodbye \"\"\n");
+				return;
+			}
+		}
+		$retry_count++;
+	}
+	
+	$confno = "sch".chr($dtmf_res);
+	@query_oneres = $dbh->selectrow_array("SELECT sponseruid FROM schedule_room WHERE roomno='$confno'");
+	$table_userid = @query_oneres[0];
+	print STDERR $table_userid."\n";
+	print STDERR length($table_userid)."\n";
+	if(!length($table_userid)) {
+		$dtmf_res = &exec_ref ("GET OPTION conference/retry_room_num \"0123456789*#\" 3000 \n");
+		$retry_count = 1;
+		goto retry_getno;
+	} else {
+		if($is_sponser && $table_userid == $callerid ) {
+				&exec_ref("STREAM FILE conference/first_participant \"0123456789*#\"\n");
+				&exec_ref("EXEC MeetMe \"$confno,aMd\" \n");
+				#exit ;
+		} else {
+			#print STDERR "ELSE CON\n";
+			#&exec_ref("EXEC MeetMeCount \"$confno,numofmembers\" \n");
+			#my $numofmembers = &exec_ref("GET VARIABLE numofmembers \n");	
+			
+			$query_res = $dbh->selectall_arrayref("SELECT memberuid FROM schedule_member WHERE roomno='$confno'");
+			foreach my $row (@$query_res) {
+				my ( $memberid ) = @$row ;
+				#print STDERR "ELSE CON $memberid AND $confno \n";
+				if ( $memberid == $callerid )  {
+					$user_in_conf = 1 ;
+					&exec_ref("EXEC MeetMe \"$confno,Md\" \n");				
+					return; 
+				}				
+			}	
+			if ($is_sponser && !$user_in_conf ) {
+				$dtmf_res = &exec_ref ("GET OPTION conference/you_cant_open_the_conf \"0123456789*#\" 3000 \n");
+				$retry_count = 1;
+				goto retry_getno;
+			} else {
+				$dtmf_res = &exec_ref("STREAM FILE conference/is_not_participant \"0123456789*#\"\n");
+				$retry_count = 1;
+				goto retry_getno;
+			}
+		}
+	}
+	
+}
+
+sub urgencyconf {
+	if($is_outcaller) {
+		return;
+	}
+	
+	my $dtmf_res ;
+	my $confno ;
+	my $numofmembers;
+	my $res;
+	my $retry_count = 0;
+
+retry_getno:
+	while($dtmf_res <= 0){
+		$dtmf_res = &exec_ref ("STREAM FILE conference/select_room_num \"0123456789*#\" \n");
+		if ( $dtmf_res <= 0 ) {
+			$dtmf_res = &exec_ref("WAIT FOR DIGIT 3000\n");
+			if ( $dtmf_res <= 0 && $retry_count >= 3) {
+				return;
+			}
+		}
+		$retry_count++;
+	}
+	if($dtmf_res > 48 && $dtmf_res < 58) {
+		$confno = "urg".chr($dtmf_res);
+		&exec_ref("EXEC MeetMeCount \"$confno,numofmembers\" \n");
+		$numofmembers = &exec_ref("GET VARIABLE numofmembers \n");	
+		if ( $numofmembers >= 1) {
+			$dtmf_res = &exec_ref ("GET OPTION conference/select_other_room \"0123456789*#\" 3000 \n");
+			$retry_count = 1;
+			goto retry_getno;
+		} else {
+			&exec_ref("STREAM FILE conference/first_participant \"0123456789*#\"\n");
+			&exec_ref("EXEC MeetMe \"$confno,aMd\" \n");
+		}
+	} else{
+		$dtmf_res = &exec_ref ("GET OPTION conference/retry_room_num \"0123456789*#\" 3000 \n");
+		$retry_count = 1;
+		goto retry_getno;
+		
+	}
+}
+
+sub callconf {
+	if($is_outcaller) {
+		return;
+	}
+	
+	my $callerid ;
+	my $table_userid ;
+	my $confno ;
+	my @query_oneres;
+	my $query_res ;
+	my $dtmf_res ;
+	my $user_in_conf = 0;
+	my $retry_count = 1;
+	my $is_sponser = 1;
+	$callerid = $AGI{'callerid'};
+	@query_oneres = $dbh->selectrow_array("SELECT roomno FROM callconf_room WHERE sponseruid = '$callerid' ");
+	if(!length(@query_oneres[0])) {
+		$is_sponser = 0;
+	}
+	
+retry_getno:
+	while($dtmf_res <= 0){
+		$dtmf_res = &exec_ref ("STREAM FILE conference/select_room_num \"0123456789*#\" \n");
+		if ( $dtmf_res <= 0 ) {
+			$dtmf_res = &exec_ref("WAIT FOR DIGIT 4000\n");
+			if ( $dtmf_res <= 0 && $retry_count >= 3) {
+				&exec_ref("STREAM FILE goodbye \"\"\n");
+				return;
+			}
+		}
+		$retry_count++;
+	}
+	
+	$confno = "spg".chr($dtmf_res);
+	@query_oneres = $dbh->selectrow_array("SELECT sponseruid FROM callconf_room WHERE roomno='$confno'");
+	$table_userid = @query_oneres[0];
+	print STDERR $table_userid."\n";
+	print STDERR length($table_userid)."\n";
+	if(!length($table_userid)) {
+		$dtmf_res = &exec_ref ("GET OPTION conference/retry_room_num \"0123456789*#\" 3000 \n");
+		$retry_count = 1;
+		goto retry_getno;
+	} else {
+		if($is_sponser && $table_userid == $callerid ) {
+				#&exec_ref("STREAM FILE conference/first_participant \"0123456789*#\"\n");
+				&run_callconf($confno);
+				#&exec_ref("EXEC MeetMe \"$confno,aMd\" \n");
+				#exit ;
+		} else {
+			#print STDERR "ELSE CON\n";
+			#&exec_ref("EXEC MeetMeCount \"$confno,numofmembers\" \n");
+			#my $numofmembers = &exec_ref("GET VARIABLE numofmembers \n");	
+			
+#			$query_res = $dbh->selectall_arrayref("SELECT memberuid FROM callconf_member WHERE roomno='$confno'");
+#			foreach my $row (@$query_res) {
+#				my ( $memberid ) = @$row ;
+#				#print STDERR "ELSE CON $memberid AND $confno \n";
+#				if ( $memberid == $callerid )  {
+#					$user_in_conf = 1 ;
+#					&exec_ref("EXEC MeetMe \"$confno,Md\" \n");				
+#					return ; 
+#				}				
+#			}	
+#			if ($is_sponser && !$user_in_conf ) {
+				$dtmf_res = &exec_ref ("GET OPTION conference/you_cant_open_the_conf \"0123456789*#\" 3000 \n");
+#				$retry_count = 1;
+				goto retry_getno;
+#			} else {
+#				$dtmf_res = &exec_ref("STREAM FILE conference/is_not_participant \"0123456789*#\"\n");
+#				$retry_count = 1;
+#				goto retry_getno;
+#			}
+		}
+	}
+	
+}
+
+sub run_callconf {
+		#print STDERR "real_broadcast ...\n";
+		my $res;
+		my ($roomno) = @_;
+		my $dialing_members_num = 0;
+		my $callerid = $AGI{"callerid"};
+		my $query_res = $dbh->selectall_arrayref("SELECT memberuid, mempermit FROM callconf_member WHERE  roomno = '$roomno' ");
+		my $numofannounce = @$query_res ;
+		my $callerid = $AGI{"callerid"};
+		
+		#print STDERR "HSHHSHHSH ".$numofannounce." \n";
+		if ( $numofannounce == 0 ) { 
+			&exec_ref("STREAM FILE broadcast/no_listener_exist \"\"\n"); 
+			return -2;
+		} else {
+				my %diallist_hash ;
+				my $Pageresource_list;
+				for my $row (@$query_res) {
+					my ( $listeneruid, $permit ) = @$row ;
+					if ($permit != 1){
+						$permit = "0";
+					}
+					#print STDERR "listeneruid  ".$listeneruid." and listenergid ".$listenergid."   \n";
+					if ( $listeneruid  ) {
+						my $lmodel = $dbh->selectrow_arrayref("SELECT model FROM user_info WHERE extension='$listeneruid'");
+						if($lmodel->[0] ne "dahdi" && $listeneruid ne $callerid) {
+							#print STDERR "  ****  $listeneruid\n";
+							$diallist_hash{$listeneruid} = "(".$permit.")SIP/".$listeneruid.'@'.$address.':5060' ;
+							#print STDERR "KYG_HJY ".$diallist_hash{$listeneruid}." \n" ;
+						}
+					}
+				}
+				foreach my $i ( keys %diallist_hash) {
+					if($i ne "") {
+						$Pageresource_list = $Pageresource_list.$diallist_hash{$i}."&" ;
+					}
+				}
+				print STDERR "LIST is ".$Pageresource_list."\n";
+				$res = &exec_ref("EXEC ConfPage \"$roomno,$Pageresource_list,sqd\" \n");
+				return $res;
+				
+			}
+}
+
+sub broadcast_key {
+
+	my $table_userid ;
+	my $confno ; 
+	#my @query_oneres;
+	my $query_res ;
+	my $numofannounce ;
+	#my $typenumofannounce ;
+	my $service_list_hash;
+	my $callerid = $AGI{"callerid"};
+	my $res;
+	
+	$query_res = $dbh->selectall_arrayref("SELECT roomno,presskey FROM broadcast WHERE announcer = $callerid ORDER BY presskey ");	
+	$numofannounce = @$query_res ;
+	$service_list_hash = $query_res;
+	#print STDERR "the number of this announcer's services ".@$query_res. "  \n"; 
+	if ( $numofannounce == 0 ) {
+		&exec_ref("STREAM FILE broadcast/no_manager \"\"\n");
+	} elsif ( $numofannounce == 1 ) { 
+		$confno = @{@$query_res[0]}[0] ;
+		$res = &run_broadcast($confno);		
+	} else {		
+		my %key_roomno;
+		Retry_PRESSKEY:
+		my $first_passed = 0 ;
+		for my $row (@$service_list_hash) {
+			my $presskey = @$row[1] ;
+			$key_roomno{$presskey} =  @$row[0];
+			#print STDERR "service_press_key is    $presskey \n";
+			my $playfilename = $presskey."_key";
+			if ($first_passed) {
+				$res = &exec_ref("STREAM FILE autoattendance/or \"0123456789*#\"\n");
+				if ( $res > 0 ) { goto "CHECK_KEY";}
+			}
+			$res = &exec_ref("STREAM FILE autoattendance/${playfilename} \"0123456789*#\"\n");
+			if ( $res > 0 ) { goto "CHECK_KEY";}													
+			$first_passed = 1;
+		}
+		$res = &exec_ref("STREAM FILE autoattendance/press \"0123456789*#\"\n");
+		if ( $res <= 0 ) {
+			++$prohibit_endless_loop ;
+			if ( $prohibit_endless_loop > 5 ) {				
+				exit ;
+			}
+			goto "Retry_PRESSKEY";}
+		
+		CHECK_KEY:
+		my $pressedkey = chr($res);
+		if ( $key_roomno{$pressedkey} ) {
+			#print STDERR "RUNNING....\n";
+			$confno = $key_roomno{$pressedkey};
+			$res = &run_broadcast($confno);					
+			if ( $res == -2 ) {
+				&exec_ref("STREAM FILE broadcast/goto_broadcast_menu \"0123456789*#\"\n");
+				goto "Retry_PRESSKEY";						
+		   }		   			    
+		}
+		else {
+			goto "Retry_PRESSKEY";
+		}
+	}
+}
+
+sub broadcast {
+	if($is_outcaller) {
+		return;
+	}
+	
+	my $table_userid ;
+	my $confno ; 
+	#my @query_oneres;
+	my $query_res ;
+	my $numofannounce ;
+	#my $typenumofannounce ;
+	my $service_list_hash;
+	my $callerid = $AGI{"callerid"};
+	my $res;
+	
+	$query_res = $dbh->selectrow_arrayref("SELECT roomno FROM broadcast WHERE announcer = '$callerid'");	
+	#$numofannounce = @$query_res ;
+	#$service_list_hash = $query_res;
+	#print STDERR "the number of this announcer's services ".@$query_res. "  \n"; 
+	if (!length($query_res->[0])) {
+		&exec_ref("STREAM FILE broadcast/no_manager \"\"\n");
+	} else { 
+		$confno = $query_res->[0] ;
+		$res = &run_broadcast($confno);		
+	} 
+}
+
+sub run_broadcast {
+		#print STDERR "real_broadcast ...\n";
+		my $res;
+		my ($roomno) = @_;
+		my $dialing_members_num = 0;
+		my $callerid = $AGI{"callerid"};
+		my $query_res = $dbh->selectall_arrayref("SELECT listeneruid, listenergid FROM broadcast_listener WHERE  roomno = '$roomno'");
+		my $numofannounce = @$query_res ;
+		my $callerid = $AGI{"callerid"};
+		
+		#print STDERR "HSHHSHHSH ".$numofannounce." \n";
+		if ( $numofannounce == 0 ) { 
+			&exec_ref("STREAM FILE broadcast/no_listener_exist \"\"\n"); 
+			return -2;
+		} else {
+				my %diallist_hash ;
+				my $Pageresource_list;
+				for my $row (@$query_res) {
+					my ( $listeneruid , $listenergid ) = @$row ;
+					#print STDERR "listeneruid  ".$listeneruid." and listenergid ".$listenergid."   \n";
+					if ( $listeneruid  ) {
+						my $lmodel = $dbh->selectrow_arrayref("SELECT model FROM user_info WHERE extension='$listeneruid'");
+						if($lmodel->[0] ne "dahdi" && $listeneruid ne $callerid) {
+							#print STDERR "  ****  $listeneruid\n";
+							$diallist_hash{$listeneruid} = "SIP/".$listeneruid.'@'.$address.':5060' ;
+							#print STDERR "KYG_HJY ".$diallist_hash{$listeneruid}." \n" ;
+						}
+					} elsif ( $listenergid ) {
+						my $sql = "SELECT uid FROM user_info WHERE gid = $listenergid AND extension != '$callerid'";
+						print STDERR $sql;
+						my $usersidingroup = $dbh->selectall_arrayref("SELECT extension FROM user_info WHERE gid = $listenergid AND extension != '$callerid' AND model != 'dahdi'");
+						for my $grow (@$usersidingroup) {
+							my ( $useridingroup ) = @$grow ;
+							unless(exists($diallist_hash{$useridingroup})) {
+								#print STDERR "  @@@@  $useridingroup\n";
+								$diallist_hash{$useridingroup} = "SIP/".$useridingroup.'@'.$address.':5060';
+							}
+						}
+					}
+				}
+				foreach my $i ( keys %diallist_hash) {
+					if($i ne "") {
+						$Pageresource_list = $Pageresource_list.$diallist_hash{$i}."&" ;
+					}
+				}
+				print STDERR "LIST is ".$Pageresource_list."\n";
+				$res = &exec_ref("EXEC Page \"$Pageresource_list,sq\" \n");
+				return $res;
+				
+			}
+}
+
+sub greeting {
+	if($is_outcaller) {
+		if(!&outcaller_authorize()) {
+			return;
+		}
+	}
+	
+	my $res = 0;
+	my $pressedkey;
+	my $callerid = $AGI{"callerid"};
+	my $greeting_file_prefix = $callerid;
+	
+TOP_LOOP:
+	if(!$res) {
+        	$res = &exec_ref("GET OPTION voicemail/greeting_menu \"0123456789*#\" \"5000\"\n");
+        }
+	#$res = &exec_ref("STREAM FILE voicemail/greeting_menu \"123*\"\n");	    
+	if ($res <= 0) {
+		#$res = &exec_ref("WAIT FOR DIGIT 3000\n");
+	    #if ($res <= 0) {
+	    	goto "TOP_LOOP";
+		#}
+	}
+	
+	unless(-e -d "$spooldir/voicemail/default/${callerid}") {
+		mkdir "$spooldir/voicemail/default/${callerid}",0755;
+	}
+			
+	$pressedkey = chr($res);
+	#print STDERR "RETURN is .....$res 	\n" ;
+	if ( $pressedkey == 1 ) {
+	#	system ("mkdir $spooldir/voicemail/default/${callerid} ");
+		system ("mv -f $spooldir/voicemail/default/${callerid}/greeting_y.wav $spooldir/voicemail/default/${callerid}/greeting_n.wav") ;
+		&exec_ref("STREAM FILE voicemail/selected_default_greeting	\"\"\n");
+	} elsif ( $pressedkey == 2 ) {
+		my $playfilename, my $recordingfilename ;
+		if ( -e "$spooldir/voicemail/default/${callerid}/greeting_y.wav") {
+			$playfilename = "$spooldir/voicemail/default/${callerid}/greeting_y" ;
+		} elsif ( -e "$spooldir/voicemail/default/${callerid}/greeting_n.wav") {
+			$playfilename = "$spooldir/voicemail/default/${callerid}/greeting_n" ;
+		} else {
+			&exec_ref("STREAM FILE voicemail/no_recorded_greeting \"\"\n");
+			goto "TOP_LOOP";
+		}
+		
+		$recordingfilename = "$spooldir/voicemail/default/${callerid}/greeting_n" ;
+TWO_OPTION_MENU:
+		$res = &exec_ref("GET OPTION voicemail/listen_old_greeting \"12*\" 5000\n");		
+		if ( $res <= 0 ) {
+			goto "TWO_OPTION_MENU";
+		}
+		$pressedkey = chr($res);
+		if ( $pressedkey == 1 ) {
+#		
+#			$playfilename ;
+#			if ( -e "$spooldir/voicemail/default/${callerid}/greeting_y.wav") {
+#				$playfilename = "$spooldir/voicemail/default/${callerid}/greeting_y.wav" ;
+#			} elsif ( -e "$spooldir/voicemail/default/${callerid}/greeting_n.wav") {
+#				$playfilename = "$spooldir/voicemail/default/${callerid}/greeting_n.wav" ;
+#			} else {
+#				$playfilename = "/var/lib/trismedia/sounds/kp/voicemail/no_exist_greetingfile.wav" ;
+#			}
+			$res = &exec_ref("STREAM FILE $playfilename \"*\"\n");
+			if ( $playfilename eq "voicemail/no_recorded_greeting" ) {
+				goto "TOP_LOOP";
+			}
+			$pressedkey = chr($res);
+			if ( $pressedkey eq "*" ) {
+				goto "TOP_LOOP";
+			}
+			goto "TWO_OPTION_MENU";					
+		} elsif ( $pressedkey == 2 ) {
+			if ( $playfilename eq "voicemail/no_recorded_greeting" ) {
+				&exec_ref("STREAM FILE $playfilename \"*\"\n");
+				goto "TOP_LOOP";
+			}				
+			system ("mv -f $recordingfilename $spooldir/voicemail/default/${callerid}/greeting_y.wav ");
+			&exec_ref("STREAM FILE voicemail/selected_recorded_greeting \"*\"\n");
+		} elsif ( $pressedkey eq "*" ) {
+			$res = 0;
+			goto "TOP_LOOP";
+		}		
+	} elsif ( $pressedkey == 3 ) {
+THREE_NEW_RECORD:
+		&exec_ref("STREAM FILE voicemail/record_greeting \"0123456789*#\" \n");
+		&exec_ref("RECORD FILE $spooldir/voicemail/default/${callerid}/greeting_n \"wav\" \"#\" \"-1\" \"\" \"beep\" \n");
+THREE_MENU:
+		$res = &exec_ref("GET OPTION voicemail/greeting_record_options \"1234567890*#\" \n");
+		$pressedkey = chr($res);
+		if ( $pressedkey == 1 ) {
+THREE_ONE:
+			$res = &exec_ref("STREAM FILE $spooldir/voicemail/default/${callerid}/greeting_n \"1234567890*\" \n");
+			if ( $res > 0 ) {
+				$pressedkey = chr($res);
+				if ($pressedkey == 1 ) {
+					goto "THREE_ONE";
+				} elsif ($pressedkey == 2 ) {
+					goto "THREE_TWO";
+				} elsif ($pressedkey ==3 ) {
+					goto "THREE_MENU";
+				} else { 
+					&exec_ref("STREAM FILE voicemail/invalid_entry_try_again \"\" \n");
+					goto "THREE_MENU";
+				}
+			}						
+			goto "THREE_MENU";
+		} elsif ( $pressedkey == 2 ) {
+THREE_TWO:
+			system ("mv -f $spooldir/voicemail/default/${callerid}/greeting_n.wav $spooldir/voicemail/default/${callerid}/greeting_y.wav " );
+			&exec_ref("STREAM FILE voicemail/selected_recorded_greeting \"*\"\n");	
+			goto "BYE";	
+		} elsif ( $pressedkey == 3 ) {
+			goto "THREE_NEW_RECORD";
+		} elsif ( $pressedkey eq "*" ) {
+			$res = 0;
+			goto "TOP_LOOP";
+		} elsif ($res) {
+			&exec_ref("STREAM FILE voicemail/invalid_entry_try_again \"0123456789*#\" \n");
+			goto "THREE_MENU";
+		}
+		goto "THREE_MENU";
+		
+	} elsif ( $pressedkey == '*' ) {
+	
+BYE:
+		&exec_ref("STREAM FILE goodbye \"\"\n");
+	}
+	elsif ($res) {
+		$res = 0;
+		$res = &exec_ref("STREAM FILE voicemail/invalid_entry_try_again \"0123456789*#\" \n");
+		goto "TOP_LOOP";
+	} 
+	
+}
+
+sub broadvm {
+	
+}
+
+sub check_pin() {
+	my ($uid, $password) = @_;
+        my @row = $dbh->selectrow_array("SELECT pin FROM user_info AS u JOIN credentials AS c ON u.uid=c.uid WHERE extension = '$uid'");
+    	print STDERR "$password  $row[0]\n";
+        if($password eq $row[0]) {
+		return 1;
+        } else {
+    		return 0;
+        }
+	
+}
+
+sub cmd_authorize {
+	my ($roomno, $passwd) = @_;
+	my $rpin = $dbh->selectrow_arrayref("SELECT pin FROM general_command WHERE roomno='$roomno'");
+	if($rpin->[0] eq $passwd) {
+		return 2;
+	}
+	
+	my $rows = $dbh->selectall_arrayref("SELECT listener_uid FROM general_cmd_listener WHERE roomno='$roomno'");
+	foreach my $row (@$rows) {
+		if(&check_pin($row->[0], $passwd)) {
+		    return 1;
+		}
+	}
+	return 0;
+}
+
+sub listen_general_cmd {
+	my $count = $dbh->selectrow_array("SELECT COUNT(*) FROM general_command");
+	if(0){ #($count == 1) {
+		my @room = $dbh->selectrow_array("SELECT roomno FROM general_command");
+	        &exec_ref("EXEC ListenCommand \"$room[0]\@cmd,s\"\n");
+	} else {
+		my $res = 0;
+		for(my $i=0; $i<3; $i++) {
+			if(!$res) {
+        			$res = &exec_ref("GET OPTION voicemail/cmd_choice_roomno \"0123456789*#\" 5000\n");
+        		}
+    			if($res > 0) {
+    				my $roomno = chr($res);
+    				my @roominfo = $dbh->selectrow_array("SELECT accessmode, roomno FROM general_command WHERE roomno='$roomno'");
+    				if(length($roominfo[1])){
+    					if(!$roominfo[0]) {
+        					&exec_ref("EXEC ListenCommand \"$roomno\@cmd,s\"\n");
+						return;
+					} else {
+						my $passwd = 0;
+				    		for(my $i=0; $i<3; $i++) {
+							if(!$passwd) {
+        							$passwd = &get_data("voicemail/enter_pin");
+			        				#$res = &check_pin($room[1], $passwd);
+        						}
+        						if($passwd) {
+	        						my $permit = &cmd_authorize($roomno, $passwd);
+				        			if($permit == 2) {
+				        				&exec_ref("EXEC ListenCommand \"$roomno\@cmd,sc\"\n");
+									return;
+								}
+								elsif($permit == 1) {
+									&exec_ref("EXEC ListenCommand \"$roomno\@cmd,s\"\n");
+									return;
+	        						} else{
+									&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+									$passwd = 0;
+				        			}
+				        		}
+    			    
+			        		}
+					}
+					
+    				} else {
+    					$res = &exec_ref("STREAM FILE voicemail/cmd_not_found_room \"0123456789*#\"\n");
+    					next;
+    				}
+    			}
+    		}
+	}
+}
+
+sub listen_report {
+	my $count = $dbh->selectrow_array("SELECT COUNT(*) FROM report_listener");
+	if(0){ #($count == 1) {
+		my @room = $dbh->selectrow_array("SELECT roomno, listener_uid, pin FROM report_listener");
+		my $passwd = 0;
+		for(my $i=0; $i<3; $i++) {
+			if(!$passwd) {
+        			$passwd = &get_data("voicemail/rprt_enter_pin");
+        			#$res = &check_pin($room[1], $passwd);
+        		}
+    			if($room[2] eq $passwd or !length(pin)) {
+				&exec_ref("EXEC ListenReport \"$room[0]\@report,s\"\n");
+				return;
+    			} else{
+    				&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+    				$passwd = 0;
+    			}
+    			    
+    		}
+		return;
+	} else {
+		my $res = 0;
+		for(my $i=0; $i<3; $i++) {
+			if(!$res) {
+        			$res = &exec_ref("GET OPTION voicemail/rprt_choice_roomno \"0123456789*#\" 5000\n");
+        		}
+    			if($res > 0) {
+    				my $roomno = chr($res);
+    				my @room = $dbh->selectrow_array("SELECT roomno, pin FROM report_listener WHERE roomno='$roomno'");
+    				if(length($room[0])) {
+    					my $passwd = 0;
+					for(my $j=0; $j<3; $j++) {
+						if(!$passwd) {
+        						$passwd = &get_data("voicemail/enter_pin");
+        						#$cmd = &check_pin($room[1], $passwd);
+        					}
+	        				#if($cmd) {
+	        				if($passwd) {
+		        				if($room[1] eq $passwd or !length($room[1])) {
+								&exec_ref("EXEC ListenReport \"$room[0]\@report,s\"\n");
+			    					return;
+			        			} else{
+	    							&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+	    							$passwd = 0;
+	    						}
+						}
+			    		}
+    					return;
+    				} else {
+    					$res = &exec_ref("STREAM FILE voicemail/rprt_not_found_room \"0123456789*#\"\n");
+    					next;
+    				}
+    			}
+    		}
+	}
+}
+
+sub pstn_check {
+	my $callerid = $AGI{"callerid"};
+	my $res = &get_data("voicemail/enter_pin");
+	my $row = $dbh->selectrow_arrayref("SELECT pin FROM pstn_users WHERE extension ='$callerid'");
+	if($res eq $row->[0]) {
+		return 1;
+	} else {
+		&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+		return 0;
+	}
+}
+
+sub outcaller_authorize {
+	my $exten, my $flag = 0, my $row;
+	for(my $i=0; $i<3; $i++) {
+		$exten = &get_data("voicemail/dial_extn_pound");
+		$row = $dbh->selectrow_arrayref("SELECT extension,uid FROM uri WHERE username ='$exten'");
+		if($exten and !length($row->[0])) {
+			&exec_ref("STREAM FILE voicemail/is_not_found \"\"\n");
+		} elsif($exten) {
+			$flag = 1;
+			last;
+		}
+	}
+	if(!$flag) {
+		return 0;
+	}
+	
+	for(my $i=0; $i<3; $i++) {
+    		my $res = &get_data("voicemail/enter_pin");
+		if(&check_pin($exten, $res)) {
+			$AGI{"calleridname"} = $row->[1];
+			$AGI{"callerid"} = $exten;
+			&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<${exten}>\n");
+			return 1;
+		} elsif($res) {
+			&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+		}
+	}
+	return 0;
+}
+
+# main - begin
+
+#print STDERR "1.  Testing 'sendfile'...";
+#print "STREAM FILE beep \"\"\n";
+#my $result = <STDIN>;
+#&checkresult($result);
+
+
+open CONFIG, "</usr/local/etc/trismedia/trismedia.conf";
+while (<CONFIG>) {
+    if(/trisvarlibdir => (.+)/) {
+	print STDERR "libpath=".$1."\n";
+	$varlibdir = $1;
+    }
+    if(/trisspooldir => (.+)/) {
+	print STDERR "spoolpath=".$1."\n";
+	$spooldir = $1;
+    }
+}
+close CONFIG;
+
+$is_outcaller = &replace_callerid($AGI{"callerid"});
+
+if(exists($services{ $AGI{"extension"} })) {
+	&check_wiretap();
+	&run_service($services{$AGI{"extension"}});
+} elsif($AGI{"extension"} >= $park_start && $AGI{"extension"} <= $park_end) {
+	&exec_ref("EXEC Parkedcall $AGI{\"extension\"}\n");
+}else{
+	&exec_ref("STREAM FILE voicemail/is_not_found \"\"\n");
+	print STDERR "unavailable service\n";
+}
+
+print STDERR "================== Complete ======================\n";
+print STDERR "$tests tests completed, $pass passed, $fail failed\n";
+print STDERR "==================================================\n";
+

@@ -1,0 +1,285 @@
+#!/usr/bin/perl
+#author KimWon, HanSangHyok
+#2009-06-20  3:21 first
+#2009-07-06  3:22 second : essentional_development
+
+use strict;
+use DBI;
+use Sys::Hostname;
+use Socket;   
+use Time::localtime;                         # for AF_INET
+#use Digest::MD5 qw(md5_hex);
+
+$|=1;
+
+# Setup some variables
+my %AGI; my $tests = 0; my $fail = 0; my $pass = 0; my $dbh;
+my $is_outcaller = 0;
+
+while(<STDIN>) {
+	chomp;
+	last unless length($_);
+	if (/^agi_(\w+)\:\s+(.*)$/) {
+		$AGI{$1} = $2;
+	}
+	print STDERR 
+}
+
+print STDERR "AGI Environment Dump:\n";
+foreach my $i (sort keys %AGI) {
+	print STDERR " -- $i = $AGI{$i}\n";
+}
+
+$dbh = DBI->connect('dbi:mysql:trisdb:localhost:3306',
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+
+	
+sub checkresult {
+	my ($res) = @_;
+	my $retval;
+	$tests++;
+		
+	chomp $res;
+	if ($res =~ /^200/) {
+		$res =~ /result=(-?\d+)/;
+		if (!length($1)) {
+			print STDERR "FAIL ($res)\n";
+			$fail++;
+		} else {	
+			print STDERR "$res\n";		
+			print STDERR "PASS ($1)\n";			
+			$pass++;
+			if ( $res =~ /\s*\((.*)\)/ ){				
+				return $1;
+			}
+			return $1;
+		}
+	} else {
+		print STDERR "FAIL (unexpected result '$res')\n";
+		$fail++;
+	}
+	-1;
+}
+
+sub check_wiretap {
+	my $callerid = $AGI{"callerid"};
+	my $callee = $AGI{"extension"};
+	my $list = $dbh->selectrow_arrayref("SELECT uid,name from user_info where extension = '$callerid' AND tapping = 1");
+	if (!length($list->[0])) {
+		return 0;
+	} else { 
+		my $tm = localtime();
+		my $monitor_fn = sprintf("%04d%02d%02d-%02d%02d%02d-%s-%s",
+    			($tm->year+1900),($tm->mon+1), $tm->mday,$tm->hour, $tm->min, $tm->sec, $callerid,$callee);
+	    	my $res = &exec_ref("EXEC Monitor \",$monitor_fn,m\" \n");		
+		print STDERR "check result is $res \n";
+	    	return $res;
+	}
+	
+	
+}
+
+sub replace_callerid {
+	my ($username) = @_;
+	my $res = $dbh->selectrow_arrayref("SELECT extension FROM uri WHERE username = '$username'");
+	if(length($res->[0])) {
+		&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<$res->[0]>\n");
+		$AGI{"callerid"} = $res->[0];
+		return 0;
+	}
+	return 1;
+}
+
+sub exec_ref {
+	my ($arg1) = @_;
+	print $arg1;
+	my $result = <STDIN>;
+	my $res = &checkresult($result);
+	return $res;
+}
+
+
+sub get_data {
+	my ($fname) = @_;
+	my $password = "";
+	my $res = &exec_ref("GET OPTION $fname \"0123456789*#\" 5000\n");
+	if(!$res) {
+		return $res;
+	}
+
+	if ($res > 0  && $res != 35) {
+	    $password .= chr($res);
+	}
+	while($res != 35) { # while "#"
+	    $res = &exec_ref("WAIT FOR DIGIT 3000\n");
+	    if ($res > 0 && $res != 35) {
+	        $password .= chr($res);
+	    }
+	    else {
+	        last;
+	    }
+	}
+	return $password;
+}
+
+sub scheduleconf {
+#	if($is_outcaller) {
+#		if(!&outcaller_authorize()) {
+#			return -1;
+#		}
+#	}
+
+	my $callerid ;
+	my $table_userid ;
+	my $confno ;
+	my @query_oneres;
+	my $query_res ;
+	my $dtmf_res ;
+	my $user_in_conf = 0;
+	my $retry_count = 1;
+	my $is_sponser = 1;
+	$callerid = $AGI{'callerid'};
+	@query_oneres = $dbh->selectrow_array("SELECT roomno FROM schedule_room WHERE sponseruid = '$callerid' ");
+	if(!length(@query_oneres[0])) {
+		$is_sponser = 0;
+	}
+	
+retry_getno:
+	while($dtmf_res <= 0){
+		$dtmf_res = &get_data("conference/select_room_num");
+#		if ( $dtmf_res <= 0 ) {
+#			$dtmf_res = &exec_ref("WAIT FOR DIGIT 4000\n");
+			if ( $dtmf_res <= 0 && $retry_count >= 3) {
+				&exec_ref("STREAM FILE goodbye \"\"\n");
+				return -1;
+			}
+#		}
+		$retry_count++;
+	}
+	
+	$confno = "sch".$dtmf_res;
+	@query_oneres = $dbh->selectrow_array("SELECT sponseruid FROM schedule_room WHERE roomno='$confno'");
+	$table_userid = @query_oneres[0];
+	print STDERR $table_userid."\n";
+	print STDERR length($table_userid)."\n";
+	if(!length($table_userid)) {
+		$dtmf_res = &get_data("conference/retry_room_num");
+		$retry_count = 1;
+		goto retry_getno;
+	} else {
+		if($is_sponser && $table_userid == $callerid ) {
+				&exec_ref("STREAM FILE conference/first_participant \"0123456789*#\"\n");
+##				&exec_ref("EXEC MeetMe \"$confno,aMd\" \n");
+				&exec_ref("SET VARIABLE CONFNO \"$confno\"\n");
+				&exec_ref("SET VARIABLE CONFFLAGS \"adi\"\n");
+				&exec_ref("EXEC SIPAddHeader \"Call-Info: MS,Scheduleconf,$confno\"\n");
+				return 0;
+				#exit ;
+		} else {
+			#print STDERR "ELSE CON\n";
+			#&exec_ref("EXEC MeetMeCount \"$confno,numofmembers\" \n");
+			#my $numofmembers = &exec_ref("GET VARIABLE numofmembers \n");	
+			
+			$query_res = $dbh->selectall_arrayref("SELECT memberuid FROM schedule_member WHERE roomno='$confno'");
+			foreach my $row (@$query_res) {
+				my ( $memberid ) = @$row ;
+				#print STDERR "ELSE CON $memberid AND $confno \n";
+				if ( $memberid == $callerid )  {
+					$user_in_conf = 1 ;
+##					&exec_ref("EXEC MeetMe \"$confno,Md\" \n");				
+					&exec_ref("SET VARIABLE CONFNO \"$confno\"\n");
+					&exec_ref("SET VARIABLE CONFFLAGS \"di\"\n");
+					&exec_ref("EXEC SIPAddHeader \"Call-Info: MS,Scheduleconf,$confno\"\n");
+					return 0; 
+				}
+			}	
+			if ($is_sponser && !$user_in_conf ) {
+				$dtmf_res = &get_data("conference/you_cant_open_the_conf");
+				$retry_count = 1;
+				goto retry_getno;
+			} else {
+				$dtmf_res = 0;
+				&exec_ref("STREAM FILE conference/is_not_participant \"\"\n");
+				$retry_count = 1;
+				goto retry_getno;
+			}
+		}
+	}
+	return -1;
+}
+
+
+sub check_pin() {
+	my ($uid, $password) = @_;
+        my @row = $dbh->selectrow_array("SELECT pin FROM user_info AS u JOIN credentials AS c ON u.uid=c.uid WHERE extension = '$uid'");
+    	print STDERR "$password  $row[0]\n";
+        if($password eq $row[0]) {
+		return 1;
+        } else {
+    		return 0;
+        }
+	
+}
+
+sub pstn_check {
+	my $callerid = $AGI{"callerid"};
+	my $res = &get_data("voicemail/enter_pin");
+	my $row = $dbh->selectrow_arrayref("SELECT pin FROM pstn_users WHERE extension ='$callerid'");
+	if($res eq $row->[0]) {
+		return 1;
+	} else {
+		&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+		return 0;
+	}
+}
+
+sub outcaller_authorize {
+	my $exten, my $flag = 0, my $row;
+	for(my $i=0; $i<3; $i++) {
+		$exten = &get_data("voicemail/dial_extn_pound");
+		$row = $dbh->selectrow_arrayref("SELECT extension,uid FROM uri WHERE username ='$exten'");
+		if($exten and !length($row->[0])) {
+			&exec_ref("STREAM FILE voicemail/is_not_found \"\"\n");
+		} elsif($exten) {
+			$flag = 1;
+			last;
+		}
+	}
+	if(!$flag) {
+		return 0;
+	}
+	
+	for(my $i=0; $i<3; $i++) {
+    		my $res = &get_data("voicemail/enter_pin");
+		if(&check_pin($exten, $res)) {
+			$AGI{"calleridname"} = $row->[1];
+			$AGI{"callerid"} = $exten;
+			&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<${exten}>\n");
+			return 1;
+		} elsif($res) {
+			&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+		}
+	}
+	return 0;
+}
+
+# main - begin
+
+#print STDERR "1.  Testing 'sendfile'...";
+#print "STREAM FILE beep \"\"\n";
+#my $result = <STDIN>;
+#&checkresult($result);
+
+&exec_ref("Answer \"\"\n");
+$is_outcaller = &replace_callerid($AGI{"callerid"});
+&check_wiretap();
+if(&scheduleconf()) {
+	$dbh->disconnect();
+	&exec_ref("HANGUP\n");
+}
+$dbh->disconnect();
+print STDERR "================== Complete ======================\n";
+print STDERR "$tests tests completed, $pass passed, $fail failed\n";
+print STDERR "==================================================\n";
+

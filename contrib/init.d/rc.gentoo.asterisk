@@ -1,0 +1,26 @@
+#!/sbin/runscript
+# $Id: rc.gentoo.trismedia 119302 2008-05-30 16:47:24Z mvanbaak $
+
+depend() {
+	need net logger
+}
+
+start() {
+	# Check if Trismedia is already running.  If it is, then bug out, because
+	# starting safe_trismedia when Trismedia is running is very bad.
+	VERSION=`${ASTSBINDIR}/trismedia -rx 'core show version'`
+	if [ "`echo $VERSION | cut -c 1-8`" = "Trismedia" ]; then
+		echo "Trismedia is already running.  $0 will exit now."
+		exit 1
+	fi
+
+	ebegin "Starting Trismedia"
+	/usr/sbin/trismedia
+	eend $? "Failed to start Trismedia"
+}
+
+stop() {
+	ebegin "Stopping Trismedia"
+	kill $(cat /var/run/trismedia.pid)
+	eend $? "Failed to stop Trismedia"
+}

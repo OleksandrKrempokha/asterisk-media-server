@@ -1,0 +1,36 @@
+#!/bin/sh
+if test ! -f .flavor ; then
+    cat << END
+/*
+ * version.h 
+ * Automatically generated
+ */
+#define TRISMEDIA_VERSION "${TRISMEDIAVERSION}"
+#define TRISMEDIA_VERSION_NUM ${TRISMEDIAVERSIONNUM}
+
+END
+elif test ! -f .version ; then
+    aadkflavor=`cat .flavor`
+    cat << END
+/*
+ * version.h 
+ * Automatically generated
+ */
+#define TRISMEDIA_VERSION "${TRISMEDIAVERSION} (${aadkflavor})"
+#define TRISMEDIA_VERSION_NUM ${TRISMEDIAVERSIONNUM}
+
+END
+else
+    aadkver=`cat .version`
+    aadkflavor=`cat .flavor`
+    cat << END
+/*
+ * version.h 
+ * Automatically generated
+ */
+#define TRISMEDIA_VERSION "${TRISMEDIAVERSION} (${aadkflavor} ${aadkver})"
+#define TRISMEDIA_VERSION_NUM ${TRISMEDIAVERSIONNUM}
+
+END
+fi
+

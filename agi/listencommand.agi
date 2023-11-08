@@ -1,0 +1,324 @@
+#!/usr/bin/perl
+#author KimWon, HanSangHyok
+#2009-06-20  3:21 first
+#2009-07-06  3:22 second : essentional_development
+
+use strict;
+use DBI;
+use Sys::Hostname;
+use Socket;   
+use Time::localtime;                         # for AF_INET
+#use Digest::MD5 qw(md5_hex);
+
+$|=1;
+
+# Setup some variables
+my %AGI; my $tests = 0; my $fail = 0; my $pass = 0; my $dbh;
+my $is_outcaller = 0;
+my $varlibdir="/usr/local/var/trismedia";
+my $spooldir="/usr/local/spool/trismedia";
+
+while(<STDIN>) {
+	chomp;
+	last unless length($_);
+	if (/^agi_(\w+)\:\s+(.*)$/) {
+		$AGI{$1} = $2;
+	}
+	print STDERR 
+}
+
+print STDERR "AGI Environment Dump:\n";
+foreach my $i (sort keys %AGI) {
+	print STDERR " -- $i = $AGI{$i}\n";
+}
+
+$dbh = DBI->connect('dbi:mysql:trisdb:localhost:3306',
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+
+
+sub checkresult {
+	my ($res) = @_;
+	my $retval;
+	$tests++;
+		
+	chomp $res;
+	if ($res =~ /^200/) {
+		$res =~ /result=(-?\d+)/;
+		if (!length($1)) {
+			print STDERR "FAIL ($res)\n";
+			$fail++;
+		} else {	
+			print STDERR "$res\n";		
+			print STDERR "PASS ($1)\n";			
+			$pass++;
+			if ( $res =~ /\s*\((.*)\)/ ){				
+				return $1;
+			}
+			return $1;
+		}
+	} else {
+		print STDERR "FAIL (unexpected result '$res')\n";
+		$fail++;
+	}
+	-1;
+}
+
+sub check_wiretap {
+	my $callerid = $AGI{"callerid"};
+	my $callee = $AGI{"extension"};
+	my $list = $dbh->selectrow_arrayref("SELECT uid,name from user_info where extension = '$callerid' AND tapping = 1");
+	if (!length($list->[0])) {
+		return 0;
+	} else { 
+		my $tm = localtime();
+		my $monitor_fn = sprintf("%04d%02d%02d-%02d%02d%02d-%s-%s",
+    			($tm->year+1900),($tm->mon+1), $tm->mday,$tm->hour, $tm->min, $tm->sec, $callerid,$callee);
+	    	my $res = &exec_ref("EXEC Monitor \",$monitor_fn,m\" \n");		
+		print STDERR "check result is $res \n";
+	    	return $res;
+	}
+	
+	
+}
+
+sub replace_callerid {
+	my ($username) = @_;
+	my $res = $dbh->selectrow_arrayref("SELECT extension FROM uri WHERE username = '$username'");
+	if(length($res->[0])) {
+		&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<$res->[0]>\n");
+		$AGI{"callerid"} = $res->[0];
+		return 0;
+	}
+	return 1;
+}
+
+sub exec_ref {
+	my ($arg1) = @_;
+	print $arg1;
+	my $result = <STDIN>;
+	my $res = &checkresult($result);
+	return $res;
+}
+
+sub get_data {
+	my ($fname) = @_;
+	my $res_data = "";
+	my $res = &exec_ref("GET OPTION $fname \"0123456789*#\" 5000\n");
+	if(!$res) {
+		return $res;
+	}
+
+	if ($res > 0  && $res != 35) {
+	    $res_data .= chr($res);
+	}
+	while($res != 35) { # while "#"
+	    $res = &exec_ref("WAIT FOR DIGIT 3000\n");
+	    if ($res > 0 && $res != 35) {
+	        $res_data .= chr($res);
+	    }
+	    else {
+	        last;
+	    }
+	}
+	if(!length($res_data)) {
+		return 0;
+	}
+	return $res_data;
+}
+
+sub check_pin() {
+	my ($uid, $password) = @_;
+        my @row = $dbh->selectrow_array("SELECT pin FROM user_info AS u JOIN credentials AS c ON u.uid=c.uid WHERE extension = '$uid'");
+    	print STDERR "$password  $row[0]\n";
+        if($password eq $row[0]) {
+		return 1;
+        } else {
+    		return 0;
+        }
+	
+}
+
+sub cmd_check_num {
+	my ($roomno, $phone_num) = @_;
+	my $rpin = $dbh->selectrow_arrayref("SELECT roomno FROM general_command WHERE roomno='$roomno' and commander_uid REGEXP '.*${phone_num}.*'");
+	if(length($rpin->[0])) {
+	    return 2;
+	}
+	
+	my $rows = $dbh->selectall_arrayref("SELECT roomno FROM general_cmd_listener WHERE roomno='$roomno' AND listener_uid = '${phone_num}'");
+	if(length($rows->[0])) {
+	    return 1;
+	}
+	return 0;
+}
+
+sub listen_general_cmd {
+	my $callerid = $AGI{"callerid"};
+	my $grade = 0;
+	my $passwd = 0;
+	my $phonenum = 0;
+	
+	my $count = $dbh->selectrow_array("SELECT COUNT(*) FROM general_command");
+	
+	if(0){ #($count == 1) {
+		my @room = $dbh->selectrow_array("SELECT roomno FROM general_command");
+#	        &exec_ref("EXEC ListenCommand \"$room[0]\@cmd,s\"\n");
+		&exec_ref("SET VARIABLE CMDOPTIONS \"$room[0]\@cmd,s\"\n");
+		return 0;
+	} else {
+		my $res = 0;
+		for(my $i=0; $i<3; $i++) {
+			if(!$res) {
+        			$res = &get_data("voicemail/cmd_choice_roomno");
+        		}
+    			if($res > 0) {
+    				my $roomno = $res;
+    				my @roominfo = $dbh->selectrow_array("SELECT accessmode, roomno FROM general_command WHERE roomno='$roomno'");
+    				if(length($roominfo[1])){
+    					if(!$roominfo[0]) {
+#        					&exec_ref("EXEC ListenCommand \"$roomno\@cmd,s\"\n");
+							my $rpin = $dbh->selectrow_arrayref("SELECT roomno FROM general_command WHERE roomno='$roomno' and commander_uid REGEXP '.*${callerid}.*'");
+							if(length($rpin->[0])) {
+								&exec_ref("SET VARIABLE CMDOPTIONS \"$roomno\@cmd,sc\"\n");
+							} else {
+								&exec_ref("SET VARIABLE CMDOPTIONS \"$roomno\@cmd,s\"\n");
+							}
+							return 0;
+					} else {
+
+						for(my $i=0; $i<3; $i++) {
+							if(!$phonenum) {
+        							$phonenum = &get_data("voicemail/dial_extn_pound");
+			        				#$res = &check_pin($room[1], $passwd);
+        						}
+        						if($phonenum) {
+	        						$grade = &cmd_check_num($roomno, $phonenum);
+	        						 if(!$grade){
+									&exec_ref("STREAM FILE voicemail/cmd_invalid_num \"\"\n");
+									$phonenum = 0;
+				        			} else {
+				        				last;
+				        			}
+				        		}
+			        		}
+			        		if(!$grade) {
+			        			&exec_ref("STREAM FILE goodbye \"\"\n");
+			        			return -1;
+			        		}
+			        		
+				    		for(my $i=0; $i<3; $i++) {
+							if(!$passwd) {
+        							$passwd = &get_data("voicemail/enter_pin");
+			        				#$res = &check_pin($room[1], $passwd);
+        						}	
+        						if($passwd) {
+	        						my $res = &check_pin($phonenum, $passwd);
+				        			if($res) {
+				        				if($grade == 2) {
+#				        					&exec_ref("EXEC ListenCommand \"$roomno\@cmd,sc\"\n");
+										&exec_ref("SET VARIABLE CMDOPTIONS \"$roomno\@cmd,sc\"\n");
+										return 0;
+									} elsif($grade == 1) {
+#										&exec_ref("EXEC ListenCommand \"$roomno\@cmd,s\"\n");
+										&exec_ref("SET VARIABLE CMDOPTIONS \"$roomno\@cmd,s\"\n");
+										return 0;
+									}
+	        						} else{
+									&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+									$passwd = 0;
+				        			}
+				        		}
+    			    
+			        		}
+			        		&exec_ref("STREAM FILE goodbye \"\"\n");
+    						return -1;
+					}
+					
+    				} else {
+    					$res = 0;
+    					&exec_ref("STREAM FILE voicemail/cmd_not_found_room \"\"\n");
+    					next;
+    				}
+    			}
+    		}
+	}
+	&exec_ref("STREAM FILE goodbye \"\"\n");
+    	return -1;
+}
+
+sub pstn_check {
+	my $callerid = $AGI{"callerid"};
+	my $res = &get_data("voicemail/enter_pin");
+	my $row = $dbh->selectrow_arrayref("SELECT pin FROM pstn_users WHERE extension ='$callerid'");
+	if($res eq $row->[0]) {
+		return 1;
+	} else {
+		&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+		return 0;
+	}
+}
+
+sub outcaller_authorize {
+	my $exten, my $flag = 0, my $row;
+	for(my $i=0; $i<3; $i++) {
+		$exten = &get_data("voicemail/dial_extn_pound");
+		$row = $dbh->selectrow_arrayref("SELECT extension,uid FROM uri WHERE username ='$exten'");
+		if($exten and !length($row->[0])) {
+			&exec_ref("STREAM FILE voicemail/is_not_found \"\"\n");
+		} elsif($exten) {
+			$flag = 1;
+			last;
+		}
+	}
+	if(!$flag) {
+		return 0;
+	}
+	
+	for(my $i=0; $i<3; $i++) {
+    		my $res = &get_data("voicemail/enter_pin");
+		if(&check_pin($exten, $res)) {
+			$AGI{"calleridname"} = $row->[1];
+			$AGI{"callerid"} = $exten;
+			&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<${exten}>\n");
+			return 1;
+		} elsif($res) {
+			&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+		}
+	}
+	return 0;
+}
+
+# main - begin
+
+#print STDERR "1.  Testing 'sendfile'...";
+#print "STREAM FILE beep \"\"\n";
+#my $result = <STDIN>;
+#&checkresult($result);
+
+
+open CONFIG, "</usr/local/etc/trismedia/trismedia.conf";
+while (<CONFIG>) {
+    if(/trisvarlibdir => (.+)/) {
+	print STDERR "libpath=".$1."\n";
+	$varlibdir = $1;
+    }
+    elsif(/trisspooldir => (.+)/) {
+	print STDERR "spoolpath=".$1."\n";
+	$spooldir = $1;
+    }
+}
+close CONFIG;
+
+&exec_ref("Answer \"\"\n");
+$is_outcaller = &replace_callerid($AGI{"callerid"});
+&check_wiretap();
+if(&listen_general_cmd()) {
+	$dbh->disconnect();
+	&exec_ref("HANGUP\n");
+}
+$dbh->disconnect();
+print STDERR "================== Complete ======================\n";
+print STDERR "$tests tests completed, $pass passed, $fail failed\n";
+print STDERR "==================================================\n";
+

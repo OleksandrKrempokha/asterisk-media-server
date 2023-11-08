@@ -1,0 +1,36 @@
+#!/bin/sh
+if test ! -f .flavor ; then
+    EXTRA=""
+elif test ! -f .version ; then
+	aadkflavor=`cat .flavor`
+    EXTRA=" (${aadkflavor})"
+else
+    aadkver=`cat .version`
+    aadkflavor=`cat .flavor`
+    EXTRA=" (${aadkflavor} ${aadkver})"
+fi
+cat << END
+/*
+ * version.c
+ * Automatically generated
+ */
+
+#include "trismedia.h"
+
+#include "trismedia/tris_version.h"
+
+static const char trismedia_version[] = "${TRISMEDIAVERSION}${EXTRA}";
+
+static const char trismedia_version_num[] = "${TRISMEDIAVERSIONNUM}";
+
+const char *tris_get_version(void)
+{
+	return trismedia_version;
+}
+
+const char *tris_get_version_num(void)
+{
+	return trismedia_version_num;
+}
+
+END

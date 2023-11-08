@@ -1,0 +1,51 @@
+#!/bin/sh
+#
+# Start/stop/restart Trismedia PBX
+#
+# Version: 1.0 - Paul Belanger <pabelanger@gmail.com>
+#
+# 03.29.2005 - Initial Version
+#
+# $Id: rc.slackware.trismedia 119302 2008-05-30 16:47:24Z mvanbaak $
+
+trismedia_start() {
+   if [ -x /usr/sbin/trismedia ]; then
+      # Check if Trismedia is already running.  If it is, then bug out, because
+      # starting safe_trismedia when Trismedia is running is very bad.
+      VERSION=`/usr/sbin/trismedia -rx 'core show version'`
+	  if [ "`echo $VERSION | cut -c 1-8`" = "Trismedia" ]; then
+         echo "Trismedia is already running.  $0 will exit now."
+         exit 1
+      fi
+
+      echo "Starting Trismedia   /usr/sbin/trismedia"
+      /usr/sbin/trismedia
+   fi
+}
+
+trismedia_stop() {
+    # If there is no PID file, ignore this request...
+    if [ -r /var/run/trismedia.pid ]; then
+      killall trismedia
+    fi
+}
+
+trismedia_restart() {
+   trismedia_stop
+   trismedia_start
+}
+
+case "$1" in
+   'start')
+      trismedia_start
+      ;;
+   'stop')
+      trismedia_stop
+      ;;
+   'restart')
+      trismedia_restart
+      ;;
+   *)
+      echo "usage $0 start|stop|restart" ;;
+esac
+

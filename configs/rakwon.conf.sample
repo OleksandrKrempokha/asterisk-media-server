@@ -1,0 +1,16 @@
+[general]
+database=trisdb
+member_table=rakwon_member
+default_server=localhost
+default_port=5186
+subject =conf 
+seats =120 
+arrange_mode = auto
+
+[120]
+ip = 170.102.127.25
+port = 5186
+subject = test
+seats = 120
+arrange_mode = auto
+

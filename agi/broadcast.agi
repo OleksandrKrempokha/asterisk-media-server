@@ -1,0 +1,241 @@
+#!/usr/bin/perl
+#author KimWon, HanSangHyok
+#2009-06-20  3:21 first
+#2009-07-06  3:22 second : essentional_development
+
+use strict;
+use DBI;
+use Sys::Hostname;
+use Socket;   
+use Time::localtime;                         # for AF_INET
+#use Digest::MD5 qw(md5_hex);
+
+$|=1;
+
+# Setup some variables
+my %AGI; my $tests = 0; my $fail = 0; my $pass = 0; my $dbh;
+my $hostname; my $address; my $park_start = 701; my $park_end= 720;
+my $prohibit_endless_loop = 0; 
+my $is_outcaller = 0;
+my $varlibdir="/usr/local/var/trismedia";
+my $spooldir="/usr/local/spool/trismedia";
+my $cs_ipaddr = "127.0.0.1";
+
+$hostname = hostname( );
+#$address  = gethostbyname($hostname) or die "Couldn't resolve $hostname : $!";
+$cs_ipaddr = inet_ntoa(inet_aton($hostname));
+#print STDERR "HOSTNAME is ".$hostname."\n";
+#print STDERR "ADDRESS is ".$address."\n";
+
+while(<STDIN>) {
+	chomp;
+	last unless length($_);
+	if (/^agi_(\w+)\:\s+(.*)$/) {
+		$AGI{$1} = $2;
+	}
+	print STDERR 
+}
+
+print STDERR "AGI Environment Dump:\n";
+foreach my $i (sort keys %AGI) {
+	print STDERR " -- $i = $AGI{$i}\n";
+}
+
+open CONFIG, "</usr/local/etc/trismedia/trismedia.conf";
+while (<CONFIG>) {
+    if(/^trisvarlibdir => (.+)/) {
+	print STDERR "libpath=".$1."\n";
+	$varlibdir = $1;
+    }
+    elsif(/^trisspooldir => (.+)/) {
+	print STDERR "spoolpath=".$1."\n";
+	$spooldir = $1;
+    }
+    elsif(/^cs_ipaddr => (.+)/) {
+	print STDERR "cs_ipaddr=".$1."\n";
+	$cs_ipaddr = $1;
+    }
+}
+close CONFIG;
+
+sub checkresult {
+	my ($res) = @_;
+	my $retval;
+	$tests++;
+		
+	chomp $res;
+	if ($res =~ /^200/) {
+		$res =~ /result=(-?\d+)/;
+		if (!length($1)) {
+			print STDERR "FAIL ($res)\n";
+			$fail++;
+		} else {	
+			print STDERR "$res\n";		
+			print STDERR "PASS ($1)\n";			
+			$pass++;
+			if ( $res =~ /\s*\((.*)\)/ ){				
+				return $1;
+			}
+			return $1;
+		}
+	} else {
+		print STDERR "FAIL (unexpected result '$res')\n";
+		$fail++;
+	}
+	-1;
+}
+
+sub check_wiretap {
+	my $callerid = $AGI{"callerid"};
+	my $callee = $AGI{"extension"};
+	
+	$dbh = DBI->connect("dbi:mysql:trisdb:localhost:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+	my $list = $dbh->selectrow_arrayref("SELECT uid,name from user_info where extension = '$callerid' AND tapping = 1");
+	if (!length($list->[0])) {
+		$dbh->disconnect();
+		return 0;
+	} else { 
+		my $tm = localtime();
+		my $monitor_fn = sprintf("%04d%02d%02d-%02d%02d%02d-%s-%s",
+    			($tm->year+1900),($tm->mon+1), $tm->mday,$tm->hour, $tm->min, $tm->sec, $callerid,$callee);
+	    	my $res = &exec_ref("EXEC Monitor \",$monitor_fn,m\" \n");		
+		print STDERR "check result is $res \n";
+		$dbh->disconnect();
+	    	return $res;
+	}
+}
+
+sub replace_callerid {
+	my ($username) = @_;
+	$dbh = DBI->connect("dbi:mysql:trisdb:localhost:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+
+	my $res = $dbh->selectrow_arrayref("SELECT extension FROM uri WHERE username = '$username'");
+	if(length($res->[0])) {
+		&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<$res->[0]>\n");
+		$AGI{"callerid"} = $res->[0];
+		$dbh->disconnect();
+		return 0;
+	}
+	$dbh->disconnect();
+	return 1;
+}
+
+
+sub exec_ref {
+	my ($arg1) = @_;
+	print $arg1;
+	my $result = <STDIN>;
+	my $res = &checkresult($result);
+	return $res;
+}
+
+
+sub broadcast {
+#	if($is_outcaller) {
+#		return;
+#	}
+	
+	my $table_userid ;
+	my $confno ; 
+	#my @query_oneres;
+	my $query_res ;
+	my $numofannounce ;
+	#my $typenumofannounce ;
+	my $service_list_hash;
+	my $callerid = $AGI{"callerid"};
+	my $res;
+	$dbh = DBI->connect("dbi:mysql:trisdb:localhost:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+	$query_res = $dbh->selectrow_arrayref("SELECT roomno FROM broadcast WHERE announcer = '$callerid'");	
+	#$numofannounce = @$query_res ;
+	#$service_list_hash = $query_res;
+	#print STDERR "the number of this announcer's services ".@$query_res. "  \n"; 
+	if (!length($query_res->[0])) {
+		$dbh->disconnect();
+		&exec_ref("STREAM FILE broadcast/no_manager \"\"\n");
+	} else { 
+		$confno = $query_res->[0] ;
+		$dbh->disconnect();
+		$res = &run_broadcast($confno);		
+	} 
+}
+
+sub run_broadcast {
+		#print STDERR "real_broadcast ...\n";
+		my $res;
+		my ($roomno) = @_;
+		my $dialing_members_num = 0;
+		my $callerid = $AGI{"callerid"};
+		$dbh = DBI->connect("dbi:mysql:trisdb:localhost:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+		my $query_res = $dbh->selectall_arrayref("SELECT listeneruid, listenergid FROM broadcast_listener WHERE  roomno = '$roomno'");
+		my $numofannounce = @$query_res ;
+		my $callerid = $AGI{"callerid"};
+		
+		#print STDERR "HSHHSHHSH ".$numofannounce." \n";
+		if ( $numofannounce == 0 ) { 
+			$dbh->disconnect();
+			#&exec_ref("STREAM FILE broadcast/no_listener_exist \"\"\n"); 
+			return -2;
+		} else {
+				my %diallist_hash ;
+				my $Pageresource_list;
+				for my $row (@$query_res) {
+					my ( $listeneruid , $listenergid ) = @$row ;
+					#print STDERR "listeneruid  ".$listeneruid." and listenergid ".$listenergid."   \n";
+					if ( $listeneruid  ) {
+						my $lmodel = $dbh->selectrow_arrayref("SELECT model FROM user_info WHERE extension='$listeneruid'");
+						if($lmodel->[0] ne "dahdi" && $listeneruid ne $callerid) {
+							#print STDERR "  ****  $listeneruid\n";
+							$diallist_hash{$listeneruid} = "SIP/".$listeneruid.'@'.$cs_ipaddr.':5060' ;
+							#print STDERR "KYG_HJY ".$diallist_hash{$listeneruid}." \n" ;
+						}
+					} elsif ( $listenergid ) {
+						my $sql = "SELECT uid FROM user_info WHERE gid = $listenergid AND extension != '$callerid'";
+						print STDERR $sql;
+						my $usersidingroup = $dbh->selectall_arrayref("SELECT extension FROM user_info WHERE gid = $listenergid AND extension != '$callerid' AND model != 'dahdi'");
+						for my $grow (@$usersidingroup) {
+							my ( $useridingroup ) = @$grow ;
+							unless(exists($diallist_hash{$useridingroup})) {
+								#print STDERR "  @@@@  $useridingroup\n";
+								$diallist_hash{$useridingroup} = "SIP/".$useridingroup.'@'.$cs_ipaddr.':5060';
+							}
+						}
+					}
+				}
+				foreach my $i ( keys %diallist_hash) {
+					if($i ne "") {
+						$Pageresource_list = $Pageresource_list.$diallist_hash{$i}."&" ;
+					}
+				}
+				$dbh->disconnect();
+				print STDERR "LIST is ".$Pageresource_list."\n";
+				$res = &exec_ref("EXEC Page \"b$roomno,$Pageresource_list,sq\" \n");
+				return $res;
+				
+			}
+}
+
+
+#  =======================  main - begin ========================
+
+#print STDERR "1.  Testing 'sendfile'...";
+#print "STREAM FILE beep \"\"\n";
+#my $result = <STDIN>;
+#&checkresult($result);
+
+&exec_ref("Answer \"\"\n");
+$is_outcaller = &replace_callerid($AGI{"callerid"});
+&check_wiretap();
+&broadcast();
+
+print STDERR "================== Complete ======================\n";
+print STDERR "$tests tests completed, $pass passed, $fail failed\n";
+print STDERR "==================================================\n";
+

@@ -1,0 +1,224 @@
+#!/usr/bin/perl
+#author KimWon, HanSangHyok
+#2009-06-20  3:21 first
+#2009-07-06  3:22 second : essentional_development
+
+use strict;
+use DBI;
+use Sys::Hostname;
+use Socket;   
+use Time::localtime;                         # for AF_INET
+#use Digest::MD5 qw(md5_hex);
+
+$|=1;
+
+# Setup some variables
+my %AGI; my $tests = 0; my $fail = 0; my $pass = 0; my $dbh;
+my $hostname; my $address;
+$hostname = hostname( );
+$address = inet_ntoa(inet_aton($hostname));
+
+while(<STDIN>) {
+	chomp;
+	last unless length($_);
+	if (/^agi_(\w+)\:\s+(.*)$/) {
+		$AGI{$1} = $2;
+	}
+	print STDERR 
+}
+
+print STDERR "AGI Environment Dump:\n";
+foreach my $i (sort keys %AGI) {
+	print STDERR " -- $i = $AGI{$i}\n";
+}
+
+sub checkresult {
+	my ($res) = @_;
+	my $retval;
+	$tests++;
+		
+	chomp $res;
+	if ($res =~ /^200/) {
+		$res =~ /result=(-?\d+)/;
+		if (!length($1)) {
+			print STDERR "FAIL ($res)\n";
+			$fail++;
+		} else {	
+			print STDERR "$res\n";		
+			print STDERR "PASS ($1)\n";			
+			$pass++;
+			if ( $res =~ /\s*\((.*)\)/ ){				
+				return $1;
+			}
+			return $1;
+		}
+	} else {
+		print STDERR "FAIL (unexpected result '$res')\n";
+		$fail++;
+	}
+	-1;
+}
+
+sub exec_ref {
+	my ($arg1) = @_;
+	print $arg1;
+	my $result = <STDIN>;
+	my $res = &checkresult($result);
+	return $res;
+}
+
+sub get_data {
+	my ($fname) = @_;
+	my $password = "";
+	my $res = &exec_ref("GET OPTION $fname \"0123456789*#\" 5000\n");
+	if(!$res) {
+		return $res;
+	}
+
+	if ($res > 0  && $res != 35) {
+	    $password .= chr($res);
+	}
+	while($res != 35) { # while "#"
+	    $res = &exec_ref("WAIT FOR DIGIT 3000\n");
+	    if ($res > 0 && $res != 35) {
+	        $password .= chr($res);
+	    }
+	    else {
+	        last;
+	    }
+	}
+	return $password;
+}
+
+sub prompt_pin() {
+	my ($pin) = @_;
+	my $callerid = $AGI{"callerid"};
+#	if(!length($pin)) {
+#		return 1;
+#	}
+		
+	for(my $i=0; $i<3; $i++) {
+    		my $res = &get_data("voicemail/enter_pin");
+    		if($res) {
+			if($pin eq $res) {
+				return 1;
+			} else {
+				&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+			}
+		}
+	}
+	return 0;
+}
+
+sub prompt_id_pin() {
+	my $exten, my $row, my $pin;
+	my $callerid = $AGI{"callerid"};
+	$dbh = DBI->connect('dbi:mysql:trisdb:localhost:3306',
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+	($pin) = $dbh->selectrow_array("SELECT pin FROM pstn_users WHERE extension ='$callerid'");
+	$dbh->disconnect();
+	if(length($pin)) {
+		goto authorize;
+	}
+		
+	for(my $i=0; $i<3; $i++) {
+		$exten = &get_data("voicemail/dial_extn_pound");
+		$dbh = DBI->connect('dbi:mysql:trisdb:localhost:3306',
+              	'tris', 'tris',
+              	{ RaiseError => 1, AutoCommit => 1 });
+		($pin) = $dbh->selectrow_array("SELECT pin FROM pstn_users WHERE extension ='$exten'");
+		$dbh->disconnect();
+		if($exten) {
+			if(!length($pin)) {
+				&exec_ref("STREAM FILE pbx/pbx-is-not-exten \"\"\n");
+			} else {
+				goto authorize;
+			}
+		}
+	}
+	return 0;
+
+authorize:
+	for(my $i=0; $i<3; $i++) {
+    		my $res = &get_data("voicemail/enter_pin");
+    		if($res) {
+			if($pin eq $res) {
+				return 1;
+			} else {
+				&exec_ref("STREAM FILE voicemail/invalid_pin \"\"\n");
+			}
+		}
+	}
+	return 0;
+}
+
+sub empty_pin {
+	my $callerid = $AGI{"callerid"};
+	my $pin; my $exten;
+	$dbh = DBI->connect('dbi:mysql:trisdb:localhost:3306',
+	      	'tris', 'tris',
+	      	{ RaiseError => 1, AutoCommit => 1 });
+	($pin, $exten) = $dbh->selectrow_array("SELECT pin, extension FROM pstn_users WHERE extension ='$callerid'");
+	$dbh->disconnect();
+	if(length($exten) && !length($pin)) {
+		return 1;
+	}
+	return 0;
+}
+
+sub outcaller_authorize {
+
+	if(&empty_pin()) {
+		return 1;
+	}
+	
+	my $channel = $AGI{"channel"};
+	my $trunk_type = 0;
+	my $description = "";
+	my ($auth_mode, $pin);
+	print STDERR $channel."\n";
+	$dbh = DBI->connect('dbi:mysql:trisdb:localhost:3306',
+          	'tris', 'tris',
+          	{ RaiseError => 1, AutoCommit => 1 });
+        print STDERR "SELECT auth_mode, pin FROM gateway WHERE trunk_type = ${trunk_type} AND description = '${description}' AND ip_address = '${address}'\n";
+	if($channel =~ /DAHDI\/(.*)-(.*)/) {
+		$trunk_type = 2;
+		$description = $1;
+		my $gwid = "";
+		$gwid = $dbh->selectrow_array("SELECT gw_id FROM fxos WHERE channel = $description");
+		($auth_mode, $pin) = $dbh->selectrow_array("SELECT auth_mode, pin FROM gateway WHERE trunk_type = ${trunk_type} AND ip_address = '${address}' AND gw_id = $gwid");
+	} elsif($channel =~ /SS7\/(.*)/) {
+		$trunk_type = 1;
+		($auth_mode, $pin) = $dbh->selectrow_array("SELECT auth_mode, pin FROM gateway WHERE trunk_type = ${trunk_type} AND description = '${description}' AND ip_address = '${address}'");
+	}
+	
+	print STDERR $pin;
+	$dbh->disconnect();
+	
+	if($auth_mode == 1) {
+		return &prompt_pin($pin);
+	} elsif($auth_mode == 2 ) {
+		return &prompt_id_pin();
+	} 
+
+	return 1;
+}
+
+# main - begin
+#&exec_ref("EXEC Answer \"\"\n");
+if(!&outcaller_authorize()) {
+	&exec_ref("HANGUP\n");
+}
+#else {
+#	my $exten = &get_data("voicemail/dial_extn_pound");
+#	if(length($exten)) {
+#		&exec_ref("EXEC goto \"${exten},1\"\n");
+#		&exec_ref("EXEC Dial \"SIP/${exten}\@${address}:5060,30\"\n");
+#	}
+#}
+
+print STDERR "================== Complete ======================\n";
+print STDERR "$tests tests completed, $pass passed, $fail failed\n";
+print STDERR "==================================================\n";
+

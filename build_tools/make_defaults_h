@@ -1,0 +1,28 @@
+#!/bin/sh
+cat << END
+/*
+ * defaults.h 
+ * Automatically generated from build options,
+ * only used in main/trismedia.c
+ */
+#define DEFAULT_CONFIG_FILE "${ASTCONFPATH}"
+
+#define DEFAULT_CONFIG_DIR "${ASTETCDIR}"
+#define DEFAULT_MODULE_DIR "${MODULES_DIR}"
+#define DEFAULT_AGI_DIR    "${AGI_DIR}"
+#define DEFAULT_LOG_DIR    "${ASTLOGDIR}"
+
+#define DEFAULT_RUN_DIR    "${ASTVARRUNDIR}"
+#define DEFAULT_SOCKET     "${ASTVARRUNDIR}/trismedia.ctl"
+#define DEFAULT_PID        "${ASTVARRUNDIR}/trismedia.pid"
+
+#define DEFAULT_VAR_DIR    "${ASTVARLIBDIR}"
+#define DEFAULT_DB         "${ASTDBDIR}/astdb"
+
+#define DEFAULT_DATA_DIR   "${ASTDATADIR}"
+#define DEFAULT_KEY_DIR    "${ASTDATADIR}/keys"
+
+#define DEFAULT_SPOOL_DIR  "${ASTSPOOLDIR}"
+#define DEFAULT_TMP_DIR    "${ASTSPOOLDIR}/tmp"
+
+END

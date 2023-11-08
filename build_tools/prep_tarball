@@ -1,0 +1,23 @@
+#!/bin/sh -e
+
+# This script will be executed by the 'mkrelease' script to do any tasks
+# necessary during tarball creation of this project.
+#
+# It will be executed from the top-level directory of the project.
+
+make -C sounds MENUSELECT_CORE_SOUNDS=CORE-SOUNDS-EN-GSM MENUSELECT_MOH=MOH-OPSOUND-WAV WGET=wget DOWNLOAD=wget all
+make AWK=awk GREP=grep menuselect-tree
+
+make_tex_docs() {
+    # make backup of trismedia.tex because we are going to alter it
+    cp trismedia.tex trismedia.tex.orig
+    sed -e "s/TRISMEDIAVERSION/${VERSION}/" trismedia.tex > trismedia_local.tex
+    mv trismedia_local.tex trismedia.tex
+    rubber --pdf trismedia.tex
+    latex2html trismedia.tex
+    # restore backup of trismedia.tex
+    mv trismedia.tex.orig trismedia.tex
+}
+
+VERSION=`cat .version`
+cd doc/tex && make_tex_docs

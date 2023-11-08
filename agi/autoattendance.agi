@@ -1,0 +1,291 @@
+#!/usr/bin/perl
+#author KimWon, HanSangHyok
+#2009-06-20  3:21 first
+#2009-07-06  3:22 second : essentional_development
+
+use strict;
+use DBI;
+use Sys::Hostname;
+use Socket;   
+use Time::localtime;                         # for AF_INET
+#use Digest::MD5 qw(md5_hex);
+
+$|=1;
+
+# Setup some variables
+my %AGI; my $tests = 0; my $fail = 0; my $pass = 0; my $dbh;
+my %services; my $is_outcaller = 0;
+my $varlibdir="/usr/local/var/trismedia";
+my $spooldir="/usr/local/spool/trismedia";
+my $cs_ipaddr = "127.0.0.1";
+
+while(<STDIN>) {
+	chomp;
+	last unless length($_);
+	if (/^agi_(\w+)\:\s+(.*)$/) {
+		$AGI{$1} = $2;
+	}
+	print STDERR 
+}
+
+print STDERR "AGI Environment Dump:\n";
+foreach my $i (sort keys %AGI) {
+	print STDERR " -- $i = $AGI{$i}\n";
+}
+
+open CONFIG, "</usr/local/etc/trismedia/trismedia.conf";
+while (<CONFIG>) {
+    if(/^trisvarlibdir => (.+)/) {
+	print STDERR "libpath=".$1."\n";
+	$varlibdir = $1;
+    }
+    elsif(/^trisspooldir => (.+)/) {
+	print STDERR "spoolpath=".$1."\n";
+	$spooldir = $1;
+    }
+    elsif(/^cs_ipaddr => (.+)/) {
+	print STDERR "cs_ipaddr=".$1."\n";
+	$cs_ipaddr = $1;
+    }
+}
+close CONFIG;
+
+$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+
+my $srv_list = $dbh->selectall_arrayref("SELECT service_number, service_name from media_service");
+foreach (@$srv_list) {
+	$services{$_->[0]} = $_->[1];
+}
+$dbh->disconnect();
+
+sub checkresult {
+	my ($res) = @_;
+	my $retval;
+	$tests++;
+		
+	chomp $res;
+	if ($res =~ /^200/) {
+		$res =~ /result=(-?\d+)/;
+		if (!length($1)) {
+			print STDERR "FAIL ($res)\n";
+			$fail++;
+		} else {	
+			print STDERR "$res\n";		
+			print STDERR "PASS ($1)\n";			
+			$pass++;
+			if ( $res =~ /\s*\((.*)\)/ ){				
+				return $1;
+			}
+			return $1;
+		}
+	} else {
+		print STDERR "FAIL (unexpected result '$res')\n";
+		$fail++;
+	}
+	-1;
+}
+
+sub check_wiretap {
+	my $callerid = $AGI{"callerid"};
+	my $callee = $AGI{"extension"};
+	
+	$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+	my $list = $dbh->selectrow_arrayref("SELECT uid,name from user_info where extension = '$callerid' AND tapping = 1");
+	if (!length($list->[0])) {
+		$dbh->disconnect();
+		return 0;
+	} else { 
+		my $tm = localtime();
+		my $monitor_fn = sprintf("%04d%02d%02d-%02d%02d%02d-%s-%s",
+    			($tm->year+1900),($tm->mon+1), $tm->mday,$tm->hour, $tm->min, $tm->sec, $callerid,$callee);
+	    	my $res = &exec_ref("EXEC Monitor \",$monitor_fn,m\" \n");		
+		print STDERR "check result is $res \n";
+		$dbh->disconnect();
+	    	return $res;
+	}
+}
+
+sub replace_callerid {
+	my ($username) = @_;
+	$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+
+	my $res = $dbh->selectrow_arrayref("SELECT extension FROM uri WHERE username = '$username'");
+	if(length($res->[0])) {
+		&exec_ref("SET CALLERID \"$AGI{\"calleridname\"}\"<$res->[0]>\n");
+		$AGI{"callerid"} = $res->[0];
+		$dbh->disconnect();
+		return 0;
+	}
+	$dbh->disconnect();
+	return 1;
+}
+
+sub run_service {
+	my ($service_name) = @_;
+	my $callerid = $AGI{"callerid"};
+	print STDERR "service_name is ".$service_name." !!!\n";
+
+	if ($service_name =~ /^leave_vm\b/) {
+	    &exec_ref("EXEC Voicemail \"\"\n");
+	}
+	elsif ($service_name =~ /^listen_vm\b/) {
+	    &exec_ref("EXEC VoicemailMain \"$callerid\"\n");
+	}
+	elsif ($service_name =~ /^scheduleconf\b/) {
+	    &exec_ref("EXEC AGI \"scheduleconf.agi\"\n");
+	}
+	elsif ($service_name =~ /^urgencyconf\b/) {
+	    &exec_ref("EXEC AGI \"urgencyconf.agi\"\n");
+	}
+	elsif ($service_name =~ /^broadcast\b/) {
+	    
+	    &exec_ref("EXEC AGI \"broadcast.agi\"\n");
+	}
+	elsif ($service_name =~ /^announcement\b/) {
+	    &exec_ref("EXEC Announcement \"\"\n");
+	}
+	elsif ($service_name =~ /^greeting\b/) {
+	    #&greeting();
+	    #&speed_dial();
+	    &exec_ref("EXEC AGI \"greeting.agi\"\n");
+	}
+	elsif ($service_name =~ /^callconf\b/) {
+	    &exec_ref("EXEC AGI \"callconf.agi\"\n");
+	}
+	elsif ($service_name =~ /^rate\b/) {
+	    &exec_ref("EXEC CheckRate \"$callerid\"\n");
+	}
+	elsif ($service_name =~ /^prompt_message\b/) {
+	    &prompt_message($AGI{"extension"});
+	}
+}
+
+sub exec_ref {
+	my ($arg1) = @_;
+	print $arg1;
+	my $result = <STDIN>;
+	my $res = &checkresult($result);
+	return $res;
+}
+
+sub autoattendance { 
+#	if($is_outcaller) {
+#		return;
+#	}
+	$dbh = DBI->connect("dbi:mysql:trisdb:${cs_ipaddr}:3306",
+              'tris', 'tris',
+              { RaiseError => 1, AutoCommit => 1 });
+	my $useTTS = 1;
+	my $res ;
+	my $rows = $dbh->selectall_arrayref("SELECT itemkey, itemid from auto_attendance ");
+	my %hash;
+	
+	foreach (@$rows) {		
+		if($_->[1] =~ /^useTTS\b/) {
+		    $useTTS = $_->[0] =~ /y/ ? 1 : 0;
+		    #print STDERR "VALUE".$useTTS."\n";
+		} else {
+			$hash{$_->[0]} = $_->[1];
+			#print STDERR $_->[0]." AND ".$_->[1]."\n";
+		}
+				
+	}
+	$dbh->disconnect();
+	#print "STREAM FILE autoattendance/autoattendance \"0123456789*#\"\n";
+	
+	for (my $i=0; $i<3; $i++){
+		if ( $useTTS == 1 ) {
+			$res = &exec_ref("STREAM FILE autoattendance/welcome \"0123456789*#\"\n");
+			if ( $res > 0 ) { goto "AUTO_1";}
+			foreach my $numkey (sort keys %hash) {
+				if ( $numkey != "*") {
+					my $playfilename;
+					if($AGI{"language"} eq "kp" or $AGI{"language"} eq "cn") {
+						$playfilename = "to_".$hash{$numkey};
+						$res = &exec_ref("STREAM FILE autoattendance/${playfilename} \"0123456789*#\"\n");
+						if ( $res > 0 ) { goto "AUTO_1";}
+						$playfilename = ${numkey}."_key" ;
+						$res = &exec_ref("STREAM FILE autoattendance/${playfilename} \"0123456789*#\"\n");
+						if ( $res > 0 ) { goto "AUTO_1";}
+					} else {
+						$res = &exec_ref("STREAM FILE voicemail/vm-press \"0123456789*#\"\n");
+						$playfilename = ${numkey} ;
+						if(!$res) {
+							$res = &exec_ref("STREAM FILE digits/${playfilename} \"0123456789*#\"\n");
+						}
+						if(!$res) {
+							$playfilename = "to_".$hash{$numkey};
+							$res = &exec_ref("STREAM FILE autoattendance/${playfilename} \"0123456789*#\"\n");
+						}
+						if ( $res > 0 ) { goto "AUTO_1";}
+
+					}
+					
+				}
+				#print STDERR " -- $numkey = $hash{$numkey}\n";
+			}
+			#$res = &exec_ref("STREAM FILE autoattendance/press_and \"0123456789*#\"\n");
+			#if ( $res > 0 ) { goto "AUTO_1";}
+			$res = &exec_ref("STREAM FILE autoattendance/to_cancel_press_star \"0123456789*#\"\n");
+			if ( $res > 0 ) { goto "AUTO_1";}
+			
+		} else {
+			$res = &exec_ref("STREAM FILE autoattendance/autoattendance \"0123456789*#\"\n");
+	    }
+	    if ($res <= 0) {
+	    	#print STDERR "WAIT?????\n";
+	    	$res = &exec_ref("WAIT FOR DIGIT 3000 \n");
+	    	if ($res <= 0) {
+	    		next;
+			}
+	    }
+	    
+AUTO_1:if(exists($hash{chr($res)})){
+		#print STDERR $hash{chr($res)}."\n";
+		if( $res == 42 ) { # *
+			last;
+		}
+		else {
+			&run_service($hash{chr($res)});
+			return;
+		}
+	    }
+	    else {
+		$res = &exec_ref("STREAM FILE autoattendance/invalid_entry_try_again \"0123456789*#\"\n");
+		if ($res <= 0) {
+		#&exec_ref("STREAM FILE goodbye \"\"\n");
+		    next;
+		}
+		if ($res > 0) {
+		    goto "AUTO_1";
+		}
+	    }
+	}
+	&exec_ref("STREAM FILE goodbye \"\"\n");
+	#print STDERR "out of for\n";
+	    
+}
+
+
+#  =======================  main - begin ========================
+
+#print STDERR "1.  Testing 'sendfile'...";
+#print "STREAM FILE beep \"\"\n";
+#my $result = <STDIN>;
+#&checkresult($result);
+
+&exec_ref("Answer \"\"\n");
+$is_outcaller = &replace_callerid($AGI{"callerid"});
+&check_wiretap();
+&autoattendance();
+
+print STDERR "================== Complete ======================\n";
+print STDERR "$tests tests completed, $pass passed, $fail failed\n";
+print STDERR "==================================================\n";
+
